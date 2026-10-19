@@ -5,7 +5,9 @@ description: End-user browser automation with cmux. Use when you need to open si
 
 # Browser Automation with cmux
 
-Use this skill for browser tasks inside cmux webviews.
+Use this skill for browser tasks inside cmux browser surfaces.
+
+Browser commands need the optional `agent-browser` tool (https://github.com/vercel-labs/agent-browser) on PATH or installed at `/usr/lib/cmux/agent-browser`. cmux runs without it; browser commands report an error until it is installed.
 
 ## Core Workflow
 
@@ -101,7 +103,7 @@ If `get url` is empty or `about:blank`, navigate first instead of waiting on loa
 | [references/authentication.md#saving-authentication-state](references/authentication.md#saving-authentication-state) | Save authenticated state right after login |
 | [references/session-management.md](references/session-management.md) | Multi-surface isolation and state persistence patterns |
 | [references/video-recording.md](references/video-recording.md) | Current recording status and practical alternatives |
-| [references/proxy-support.md](references/proxy-support.md) | Proxy behavior in WKWebView and workarounds |
+| [references/proxy-support.md](references/proxy-support.md) | Proxy behavior and workarounds |
 
 ## Ready-to-Use Templates
 
@@ -111,9 +113,9 @@ If `get url` is empty or `about:blank`, navigate first instead of waiting on loa
 | [templates/authenticated-session.sh](templates/authenticated-session.sh) | Login once, save/load state |
 | [templates/capture-workflow.sh](templates/capture-workflow.sh) | Navigate + capture snapshots/screenshots |
 
-## Limits (WKWebView)
+## Limits
 
-These commands currently return `not_supported` because they rely on Chrome/CDP-only APIs not exposed by WKWebView:
+These commands currently return `not_supported` because the browser backend does not expose them:
 - viewport emulation
 - offline emulation
 - trace/screencast recording

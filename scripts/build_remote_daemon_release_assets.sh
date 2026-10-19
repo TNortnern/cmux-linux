@@ -109,7 +109,11 @@ for target in "${TARGETS[@]}"; do
   )
   chmod 755 "$OUTPUT_PATH"
 
-  SHA256="$(shasum -a 256 "$OUTPUT_PATH" | awk '{print $1}')"
+  if command -v sha256sum >/dev/null 2>&1; then
+    SHA256="$(sha256sum "$OUTPUT_PATH" | awk '{print $1}')"
+  else
+    SHA256="$(shasum -a 256 "$OUTPUT_PATH" | awk '{print $1}')"
+  fi
   printf '%s  %s\n' "$SHA256" "$ASSET_NAME" >> "$CHECKSUMS_PATH"
 
   printf '%s\t%s\t%s\t%s\n' "$GOOS" "$GOARCH" "$ASSET_NAME" "$SHA256" >> "$ENTRIES_FILE"

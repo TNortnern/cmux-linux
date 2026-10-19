@@ -45,14 +45,14 @@ class cmuxError(Exception):
     pass
 
 
-_APP_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/cmux")
-_STABLE_SOCKET_PATH = os.path.join(_APP_SUPPORT_DIR, "cmux.sock")
+# Linux socket location: $XDG_RUNTIME_DIR/cmux/cmux.sock (or /run/user/$UID/cmux/).
+_RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "cmux")
+_STABLE_SOCKET_PATH = os.path.join(_RUNTIME_DIR, "cmux.sock")
 _LEGACY_STABLE_SOCKET_PATH = "/tmp/cmux.sock"
 _LAST_SOCKET_PATH_FILES = [
-    os.path.join(_APP_SUPPORT_DIR, "last-socket-path"),
+    os.path.join(_RUNTIME_DIR, "last-socket-path"),
     "/tmp/cmux-last-socket-path",
 ]
-_DEFAULT_DEBUG_BUNDLE_ID = "com.cmuxterm.app.debug"
 
 
 def _sanitize_tag_slug(raw: str) -> str:
@@ -61,31 +61,9 @@ def _sanitize_tag_slug(raw: str) -> str:
     return cleaned or "agent"
 
 
-def _sanitize_bundle_suffix(raw: str) -> str:
-    # Must match scripts/reload.sh sanitize_bundle() so tagged tests can
-    # reliably target the correct app via AppleScript.
-    cleaned = re.sub(r"[^a-z0-9]+", ".", (raw or "").strip().lower())
-    cleaned = re.sub(r"\.+", ".", cleaned).strip(".")
-    return cleaned or "agent"
-
-
 def _quote_option_value(value: str) -> str:
-    # Must match TerminalController.parseOptions() quoting rules.
     escaped = (value or "").replace("\\", "\\\\").replace('"', '\\"')
     return f"\"{escaped}\""
-
-
-def _default_bundle_id() -> str:
-    override = os.environ.get("CMUX_BUNDLE_ID")
-    if override:
-        return override
-
-    tag = os.environ.get("CMUX_TAG")
-    if tag:
-        suffix = _sanitize_bundle_suffix(tag)
-        return f"{_DEFAULT_DEBUG_BUNDLE_ID}.{suffix}"
-
-    return _DEFAULT_DEBUG_BUNDLE_ID
 
 
 def _read_last_socket_path() -> Optional[str]:
@@ -137,7 +115,7 @@ def _default_socket_path() -> str:
         # Prefer the debug naming convention when we have to guess.
         return tagged_candidates[0]
 
-    override = os.environ.get("CMUX_SOCKET_PATH")
+    override = os.environ.get("CMUX_SOCKET") or os.environ.get("CMUX_SOCKET_PATH")
     if override:
         if os.path.exists(override) and _can_connect(override):
             return override
@@ -158,7 +136,7 @@ def _default_socket_path() -> str:
 
     # Otherwise, fall back to the newest discovered socket if there is one.
     tagged = glob.glob("/tmp/cmux-debug-*.sock")
-    tagged.extend(glob.glob(os.path.join(_APP_SUPPORT_DIR, "cmux*.sock")))
+    tagged.extend(glob.glob(os.path.join(_RUNTIME_DIR, "cmux*.sock")))
     tagged = [p for p in tagged if os.path.exists(p)]
     if tagged:
         tagged.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -173,15 +151,10 @@ class cmux:
     """Client for controlling cmux via Unix socket"""
 
     DEFAULT_SOCKET_PATH = _default_socket_path()
-    DEFAULT_BUNDLE_ID = _default_bundle_id()
 
     @staticmethod
     def default_socket_path() -> str:
         return _default_socket_path()
-
-    @staticmethod
-    def default_bundle_id() -> str:
-        return _default_bundle_id()
 
     def __init__(self, socket_path: str = None):
         # Resolve at init time so imports don't "lock in" a stale path.

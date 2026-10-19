@@ -9,4 +9,4 @@ Terminal=false
 Categories=System;TerminalEmulator;
 Keywords=terminal;multiplexer;tabs;splits;workspaces;gpu;
 StartupWMClass=cmux
-MimeType=
+StartupNotify=true

@@ -1,76 +1,55 @@
+# Built by packaging/scripts/build-rpm.sh from a payload staged by stage-payload.sh.
+# Defines expected from the caller: _cmux_version, _cmux_payload (staged file tree).
+
 Name:           cmux
 Version:        %{_cmux_version}
 Release:        1%{?dist}
 Summary:        GPU-accelerated terminal multiplexer
-License:        Proprietary
-URL:            https://cmux.dev
+License:        AGPL-3.0-or-later
+URL:            https://github.com/TNortnern/cmux-linux
+BuildArch:      x86_64
 
-# Pre-built binary package -- no Source0, no %build
+# Prebuilt binaries; nothing is compiled here. Dependencies are listed explicitly
+# because the binaries are not scanned for automatic requirements.
 AutoReqProv:    no
+%global debug_package %{nil}
+# Do not create /usr/lib/.build-id links for the prebuilt binaries
+%define _build_id_links none
 
-Requires:       gtk4
+Requires:       gtk4 >= 4.14
 Requires:       fontconfig
 Requires:       freetype
-Requires:       oniguruma
 Requires:       mesa-libGL
-Requires:       mesa-libEGL
-Requires:       harfbuzz
-Requires:       glib2
-Requires:       cairo
-Requires:       cairo-gobject
-Requires:       pango
-Requires:       gdk-pixbuf2
-Requires:       libepoxy
-Requires:       libxkbcommon
-Requires:       graphene
+Requires:       bzip2-libs
+Requires:       libstdc++
+Requires:       libgcc
 
 %description
-cmux is a GPU-accelerated terminal with tabs, splits, workspaces,
-and socket CLI control -- powered by Ghostty.
+cmux is a GPU-accelerated terminal multiplexer for Linux with workspaces, tabs,
+splits, session restore, notifications and socket CLI control, powered by Ghostty.
+Browser automation (agent-browser) and SSH workspaces are optional.
 
 %install
-install -Dm0755 %{_sourcedir}/cmux-app %{buildroot}%{_bindir}/cmux-app
-install -Dm0755 %{_sourcedir}/cmux %{buildroot}%{_bindir}/cmux
-install -Dm0755 %{_sourcedir}/cmuxd-remote %{buildroot}%{_libdir}/cmux/cmuxd-remote
-install -Dm0755 %{_sourcedir}/agent-browser %{buildroot}%{_libdir}/cmux/agent-browser
-
-install -Dm0644 %{_sourcedir}/com.cmux_lx.terminal.desktop %{buildroot}%{_datadir}/applications/com.cmux_lx.terminal.desktop
-install -Dm0644 %{_sourcedir}/com.cmux_lx.terminal.metainfo.xml %{buildroot}%{_datadir}/metainfo/com.cmux_lx.terminal.metainfo.xml
-
-install -Dm0644 %{_sourcedir}/icons/48x48.png %{buildroot}%{_datadir}/icons/hicolor/48x48/apps/com.cmux_lx.terminal.png
-install -Dm0644 %{_sourcedir}/icons/128x128.png %{buildroot}%{_datadir}/icons/hicolor/128x128/apps/com.cmux_lx.terminal.png
-install -Dm0644 %{_sourcedir}/icons/256x256.png %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/com.cmux_lx.terminal.png
-
-install -Dm0644 %{_sourcedir}/cmux.bash %{buildroot}%{_datadir}/bash-completion/completions/cmux
-install -Dm0644 %{_sourcedir}/_cmux %{buildroot}%{_datadir}/zsh/vendor-completions/_cmux
-install -Dm0644 %{_sourcedir}/cmux.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/cmux.fish
-
-install -Dm0644 %{_sourcedir}/cmux.1.gz %{buildroot}%{_mandir}/man1/cmux.1.gz
-
-# Skills
-for skill in cmux cmux-browser; do
-    find %{_sourcedir}/skills-${skill} -type f | while IFS= read -r f; do
-        rel="${f#%{_sourcedir}/skills-${skill}/}"
-        install -Dm0644 "$f" "%{buildroot}%{_datadir}/cmux/skills/${skill}/${rel}"
-    done
-done
-
-# CLAUDE.md
-install -Dm0644 %{_sourcedir}/CLAUDE.md %{buildroot}%{_datadir}/cmux/CLAUDE.md
+cp -a %{_cmux_payload}/. %{buildroot}/
 
 %files
+%license /usr/share/licenses/cmux/LICENSE
 %{_bindir}/cmux-app
+%{_bindir}/cmux-app.bin
 %{_bindir}/cmux
-%{_libdir}/cmux/cmuxd-remote
-%{_libdir}/cmux/agent-browser
+/usr/lib/cmux
 %{_datadir}/applications/com.cmux_lx.terminal.desktop
 %{_datadir}/metainfo/com.cmux_lx.terminal.metainfo.xml
 %{_datadir}/icons/hicolor/48x48/apps/com.cmux_lx.terminal.png
 %{_datadir}/icons/hicolor/128x128/apps/com.cmux_lx.terminal.png
 %{_datadir}/icons/hicolor/256x256/apps/com.cmux_lx.terminal.png
+%{_datadir}/icons/hicolor/scalable/apps/com.cmux_lx.terminal.svg
 %{_datadir}/bash-completion/completions/cmux
 %{_datadir}/zsh/vendor-completions/_cmux
 %{_datadir}/fish/vendor_completions.d/cmux.fish
 %{_mandir}/man1/cmux.1.gz
-%{_datadir}/cmux/CLAUDE.md
-%{_datadir}/cmux/skills/
+%{_datadir}/cmux
+
+%changelog
+* Mon Oct 19 2026 cmux-linux contributors - 0.2.0-1
+- Release package for cmux-linux 0.2.0

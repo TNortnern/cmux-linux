@@ -24,13 +24,6 @@ This doc tracks the migration from the existing v1 line protocol (space-delimite
 - [x] Add `surface.trigger_flash` (agent-visible highlight for a surface)
 - [x] Implement v2 debug/test methods (simulate typing, render stats, screenshots, etc.)
 - [x] Add `tests_v2/` using v2 client
-- [x] Add runners for v1 + v2 suites on the VM (`./scripts/run-tests-v1.sh`, `./scripts/run-tests-v2.sh`)
-- [x] Verify v1 suite passes (VM)
-- [x] Verify v2 suite passes (VM)
-
-Notes:
-- A close-top nested split sequence (T-shape) could leave terminal views detached from the window until the user switched workspaces.
-  Fix: a debounced post-close reattach pass (see `Sources/Workspace.swift`, `Sources/Panels/TerminalPanel.swift`).
 
 ## V2 Protocol Sketch
 
@@ -136,10 +129,6 @@ v1 suite stays in `tests/`.
 v2 suite lives in `tests_v2/` and should:
 - use a v2 JSON client (`tests_v2/cmux.py`)
 - avoid depending on v1 text output formats
-
-VM runners:
-- v1: `ssh cmux-vm 'cd /Users/cmux/GhosttyTabs && ./scripts/run-tests-v1.sh'`
-- v2: `ssh cmux-vm 'cd /Users/cmux/GhosttyTabs && ./scripts/run-tests-v2.sh'`
 
 ## Open Questions
 

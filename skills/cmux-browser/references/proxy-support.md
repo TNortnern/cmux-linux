@@ -13,13 +13,13 @@ How proxy behavior works for cmux browser automation.
 
 ## Current Behavior
 
-cmux browser uses WKWebView networking. Proxy behavior follows macOS/system networking and app process environment.
+cmux browser automation runs through agent-browser (Chrome DevTools Protocol). Proxy behavior follows the environment of the agent-browser process.
 
 ## What Is Not Exposed via CLI
 
 There is currently no first-class `cmux browser proxy ...` command for per-surface proxy routing.
 
-Why: WKWebView does not provide CDP-style per-context proxy controls equivalent to Chrome automation stacks.
+Why: per-surface proxy routing has not been added to the browser command set yet.
 
 ## Workarounds
 
