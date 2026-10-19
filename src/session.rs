@@ -48,8 +48,26 @@ pub fn save_session_to(data: &SessionData, path: &Path) -> std::io::Result<()> {
     let tmp_path = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    std::fs::write(&tmp_path, json.as_bytes())?;
+    write_private(&tmp_path, json.as_bytes())?;
     std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Writes `bytes` to a new file at `path` with mode 0600. The session records working
+/// directories, so other users must not read it. A stale file at `path` (left by a crash)
+/// is removed first, so the mode always applies.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let _ = std::fs::remove_file(path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -161,6 +179,25 @@ mod tests {
         // After successful save: session.json exists, .tmp must be gone (renamed).
         assert!(path.exists(), "session.json must exist after save");
         assert!(!tmp_path.exists(), "session.json.tmp must be gone after successful rename");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Session files record working directories, so they must be private to the user.
+    #[test]
+    fn session_file_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("cmux-test-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        // A stale, world-readable file from an earlier run must not keep its mode.
+        std::fs::write(&path, b"stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_session_to(&dummy_session("PermTest"), &path).expect("save failed");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "session.json must be readable only by its owner");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -54,26 +54,10 @@ pub fn wire_sidebar_clicks(
         move |_list, row| {
             let index = row.index() as usize;
             state.borrow_mut().switch_to_index(index);
-            // SPLIT-07: call ghostty_surface_set_focus on the newly active pane.
-            // Workspace switches are focus changes — must call set_focus after switch.
-            let surface = {
-                let mut s = state.borrow_mut();
-                s.active_split_engine_mut()
-                    .and_then(|engine| engine.root.find_active_pane_id())
-                    .and_then(|pane_id| {
-                        if let Ok(reg) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                            reg.iter()
-                                .find(|(_, &pid)| pid == pane_id)
-                                .map(|(&ptr, _)| ptr as crate::ghostty::ffi::ghostty_surface_t)
-                        } else {
-                            None
-                        }
-                    })
-            };
-            if let Some(surface) = surface {
-                unsafe {
-                    crate::ghostty::ffi::ghostty_surface_set_focus(surface, true);
-                }
+            // SPLIT-07: workspace switches are focus changes — notify Ghostty of the newly active pane.
+            let s = state.borrow();
+            if let Some(engine) = s.active_split_engine() {
+                engine.focus_active_surface();
             }
         }
     });

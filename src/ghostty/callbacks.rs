@@ -1,3 +1,4 @@
+use crate::ghostty::surface::PaneCtx;
 use gtk4::ffi;
 use gtk4::prelude::{GLAreaExt, WidgetExt};
 use std::collections::HashMap;
@@ -21,16 +22,14 @@ pub static WAKEUP_PENDING: AtomicBool = AtomicBool::new(false);
 /// Safety: ghostty_app_t is opaque void* and only called from the GLib main thread.
 pub static APP_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The GhostttySurface handle — stored so read_clipboard_cb can complete paste requests.
-/// Safety: ghostty_surface_t is opaque void* and only accessed from the GLib main thread.
-pub static SURFACE_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// Registry of all live GLArea instances. wakeup_cb iterates this to queue_render all panes.
 /// Stores raw pointers because gtk4::GLArea is not Send/Sync. The pointers are only
 /// dereferenced on the main thread inside glib::idle_add_once closures.
+/// An entry is added when a pane's surface is created and removed by teardown_pane,
+/// before the GLArea can be finalized.
 pub static GL_AREA_REGISTRY: Mutex<Vec<GtkGLAreaPtr>> = Mutex::new(Vec::new());
 
-/// Maps surface_ptr (as usize) → pane_id for close_surface_cb routing.
+/// Maps surface_ptr (as usize) → pane_id.
 pub static SURFACE_REGISTRY: LazyLock<Mutex<HashMap<usize, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -41,9 +40,6 @@ pub static BELL_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Called by Ghostty from its renderer thread. Must not call any ghostty_* API inline.
 /// Instead, schedules ghostty_app_tick() on the GLib main loop (per D-04, GHOST-07).
-/// Wakeup count for diagnostic logging (only logs occasionally to avoid spam)
-static WAKEUP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub unsafe extern "C" fn wakeup_cb(_userdata: *mut std::ffi::c_void) {
     // Swap: if already pending, another idle task is queued — skip.
     if WAKEUP_PENDING.swap(true, Ordering::SeqCst) {
@@ -51,12 +47,6 @@ pub unsafe extern "C" fn wakeup_cb(_userdata: *mut std::ffi::c_void) {
     }
     glib::idle_add_once(|| {
         WAKEUP_PENDING.store(false, Ordering::SeqCst);
-
-        // Log wakeup occasionally to verify it's firing
-        let count = WAKEUP_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-        if count % 60 == 1 {
-            eprintln!("cmux: wakeup_cb #{}", count);
-        }
 
         let app_ptr = APP_PTR.load(Ordering::SeqCst);
         if app_ptr != 0 {
@@ -83,16 +73,15 @@ pub unsafe extern "C" fn wakeup_cb(_userdata: *mut std::ffi::c_void) {
 pub static GL_TO_SURFACE: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Called by Ghostty when a surface wants to close (e.g. shell exits).
-/// Runs on the GLib main thread (called during ghostty_app_tick).
-/// Per D-09: no GUI dialog — exit the process.
-/// The bool argument indicates whether the process was still active when closed.
-pub unsafe extern "C" fn close_surface_cb(_userdata: *mut std::ffi::c_void, _process_alive: bool) {
-    // Do NOT call process::exit — Phase 2 handles per-pane close gracefully.
-    // Identify which pane closed via SURFACE_REGISTRY (populated at surface creation).
-    // Full AppState.close_pane() dispatch is wired in Plan 04.
-    // For now, log the event so the executor can verify routing works.
-    eprintln!("cmux: close_surface_cb fired — per-pane close will be handled by AppState");
+/// Called by Ghostty when a surface wants to close (its shell exited, or a close action fired).
+/// Runs inside ghostty_app_tick on the GLib main thread. Closing a pane frees the surface that
+/// ghostty is still processing, so the close is deferred to an idle callback. That callback
+/// carries only the pane id; it finds the pane again through AppState.
+pub unsafe extern "C" fn close_surface_cb(userdata: *mut std::ffi::c_void, _process_alive: bool) {
+    let Some(pane_id) = (userdata as *const PaneCtx).as_ref().map(|ctx| ctx.pane_id) else {
+        return;
+    };
+    glib::idle_add_once(move || crate::app_state::close_pane_request(pane_id));
 }
 
 /// Action callback — Ghostty fires actions (e.g. new tab, font size changes).

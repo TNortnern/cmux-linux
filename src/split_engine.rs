@@ -1,6 +1,30 @@
 use crate::ghostty::ffi;
+use crate::ghostty::surface::{teardown_pane, PaneCtx, PaneSurface, SurfaceCell};
 use gtk4::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
+
+/// Process-wide pane ID counter. IDs start at 1 because 0 means "no pane" (BELL_PANE_ID).
+static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a pane ID that is unique across all workspaces and restored sessions.
+pub fn alloc_pane_id() -> u64 {
+    NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Outcome of closing a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseResult {
+    /// The pane is gone. Carries the pane that is active in this workspace afterwards.
+    Closed(u64),
+    /// The pane is the workspace's only terminal (or its only pane). Nothing was changed;
+    /// the caller decides whether to close the whole workspace.
+    LastPane,
+    /// The pane does not exist, or the tree is in an unexpected state. Nothing was changed.
+    Failed,
+}
 
 /// Direction for pane focus navigation (Ctrl+Shift+arrows per D-10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +46,11 @@ pub enum SplitNode {
     Leaf {
         pane_id: u64,
         gl_area: gtk4::GLArea,
-        surface: ffi::ghostty_surface_t,
+        /// The pane's live Ghostty surface. Filled by the realize callback and cleared by
+        /// teardown. Read the surface only through this handle.
+        surface: SurfaceCell,
+        /// Per-pane context shared with Ghostty as surface userdata. Freed by teardown_pane.
+        ctx: *mut PaneCtx,
         /// Stable UUID for session persistence and v2 socket protocol pane identity.
         uuid: Uuid,
         /// Phase 4 NOTF-01: true when this pane has unread bell activity.
@@ -136,35 +164,12 @@ impl SplitNode {
         }
     }
 
-    /// Collect all leaf pane_ids into a Vec (for cleanup on workspace close).
-    pub fn collect_pane_ids(&self, out: &mut Vec<u64>) {
-        match self {
-            SplitNode::Leaf { pane_id, .. } | SplitNode::Preview { pane_id, .. } => out.push(*pane_id),
-            SplitNode::Split { start, end, .. } => {
-                start.collect_pane_ids(out);
-                end.collect_pane_ids(out);
-            }
-        }
-    }
-
-    /// Collect all surfaces into a Vec (for ghostty_surface_free on workspace close).
-    pub fn collect_surfaces(&self, out: &mut Vec<ffi::ghostty_surface_t>) {
-        match self {
-            SplitNode::Leaf { surface, .. } => out.push(*surface),
-            SplitNode::Preview { .. } => {} // No Ghostty surface
-            SplitNode::Split { start, end, .. } => {
-                start.collect_surfaces(out);
-                end.collect_surfaces(out);
-            }
-        }
-    }
-
     /// Find the Ghostty surface handle for a specific pane by pane_id.
     /// Used by debug.type to send text to a specific pane's surface.
     pub fn find_surface_for_pane(&self, target_id: u64) -> Option<ffi::ghostty_surface_t> {
         match self {
             SplitNode::Leaf { pane_id, surface, .. } => {
-                if *pane_id == target_id { Some(*surface) } else { None }
+                if *pane_id == target_id { *surface.borrow() } else { None }
             }
             SplitNode::Preview { .. } => None, // No Ghostty surface
             SplitNode::Split { start, end, .. } => {
@@ -191,7 +196,7 @@ impl SplitNode {
     pub fn find_by_uuid(&self, target_uuid: &str) -> Option<ffi::ghostty_surface_t> {
         match self {
             SplitNode::Leaf { uuid, surface, .. } => {
-                if uuid.to_string() == target_uuid { Some(*surface) } else { None }
+                if uuid.to_string() == target_uuid { *surface.borrow() } else { None }
             }
             SplitNode::Preview { .. } => None, // No Ghostty surface to return
             SplitNode::Split { start, end, .. } => {
@@ -292,8 +297,6 @@ fn attach_terminal_context_menu(gl_area: &gtk4::GLArea) {
 pub struct SplitEngine {
     pub root: SplitNode,
     pub active_pane_id: u64,
-    /// Monotonically increasing pane ID counter.
-    next_pane_id: u64,
     /// GTK Application handle needed to create new GLAreas.
     app: gtk4::Application,
     /// Ghostty app handle needed to create new surfaces.
@@ -302,82 +305,52 @@ pub struct SplitEngine {
 
 impl SplitEngine {
     /// Create a new SplitEngine with a single leaf pane.
-    /// The initial GLArea and surface are created by the caller (Plan 04) and passed in.
+    /// `pane` comes from `create_surface`; `pane_id` must be the id it was created with.
     pub fn new(
         app: gtk4::Application,
         ghostty_app: ffi::ghostty_app_t,
-        initial_gl_area: gtk4::GLArea,
-        initial_surface_cell: std::rc::Rc<std::cell::RefCell<Option<ffi::ghostty_surface_t>>>,
+        pane: PaneSurface,
         pane_id: u64,
     ) -> Self {
-        // The initial surface may not be realized yet. SplitEngine stores the cell
-        // so it can read the surface pointer after realize. For focus/split operations
-        // that run after realize, we read from the cell.
-        // For the tree structure, we store null initially and update after realize.
-        let surface_placeholder: ffi::ghostty_surface_t = std::ptr::null_mut();
         // Phase 9: Attach right-click context menu (D-08)
-        attach_terminal_context_menu(&initial_gl_area);
+        attach_terminal_context_menu(&pane.gl_area);
         let root = SplitNode::Leaf {
             pane_id,
-            gl_area: initial_gl_area,
-            surface: surface_placeholder,
+            gl_area: pane.gl_area,
+            surface: pane.surface,
+            ctx: pane.ctx,
             uuid: Uuid::new_v4(),
             has_attention: false,
         };
+        // Mark the pane active so the focus-gated clipboard write path accepts it.
+        root.update_focus_css(pane_id);
         SplitEngine {
             root,
             active_pane_id: pane_id,
-            next_pane_id: pane_id + 1,
             app,
             ghostty_app,
-        }
-    }
-
-    /// Update the surface pointer for a leaf after realize.
-    /// Recursively searches the tree (D-10: works for ALL leaves, not just root).
-    pub fn set_initial_surface(&mut self, pane_id: u64, surface: ffi::ghostty_surface_t) {
-        Self::set_surface_recursive(&mut self.root, pane_id, surface);
-    }
-
-    fn set_surface_recursive(node: &mut SplitNode, target_pane_id: u64, surface: ffi::ghostty_surface_t) {
-        match node {
-            SplitNode::Leaf { pane_id, surface: s, .. } => {
-                if *pane_id == target_pane_id {
-                    *s = surface;
-                }
-            }
-            SplitNode::Preview { .. } => {} // No surface to set
-            SplitNode::Split { start, end, .. } => {
-                Self::set_surface_recursive(start, target_pane_id, surface);
-                Self::set_surface_recursive(end, target_pane_id, surface);
-            }
         }
     }
 
     /// Reconstruct a SplitEngine from serialized SplitNodeData (D-05).
     /// Creates GTK widgets (GLArea for leaves, Paned for splits) and Ghostty surfaces.
     /// Fresh pane_ids are generated (D-06), but UUIDs are preserved from session.
-    /// Returns None if tree_depth > 16 (D-14).
+    /// Returns None if tree_depth > 16 (D-14). On None, every GLArea created so far is torn down.
     pub fn from_data(
         app: gtk4::Application,
         ghostty_app: ffi::ghostty_app_t,
         data: &SplitNodeData,
         active_pane_uuid: Option<&str>,
     ) -> Option<Self> {
-        let mut next_pane_id: u64 = 1;
-        let root = Self::node_from_data(&app, ghostty_app, data, &mut next_pane_id, 0)?;
+        let root = Self::node_from_data(&app, ghostty_app, data, 0)?;
         // Find active pane by saved UUID, or fall back to first leaf
         let active_id = active_pane_uuid
             .and_then(|uuid_str| root.find_pane_id_by_uuid(uuid_str))
-            .unwrap_or_else(|| {
-                let mut leaves = Vec::new();
-                collect_leaves_in_order(&root, &mut leaves);
-                leaves.first().copied().unwrap_or(1)
-            });
+            .unwrap_or_else(|| first_pane_id(&root));
+        root.update_focus_css(active_id);
         Some(SplitEngine {
             root,
             active_pane_id: active_id,
-            next_pane_id,
             app,
             ghostty_app,
         })
@@ -387,7 +360,6 @@ impl SplitEngine {
         app: &gtk4::Application,
         ghostty_app: ffi::ghostty_app_t,
         data: &SplitNodeData,
-        next_pane_id: &mut u64,
         depth: u32,
     ) -> Option<SplitNode> {
         if depth > 16 {
@@ -396,27 +368,36 @@ impl SplitEngine {
         }
         match data {
             SplitNodeData::Leaf { surface_uuid, .. } => {
-                let pane_id = *next_pane_id;
-                *next_pane_id += 1;
-                // Create surface — realize callback will create Ghostty surface and wire registries
-                let (gl_area, _surface_cell) =
-                    crate::ghostty::surface::create_surface(app, ghostty_app, None, pane_id, crate::ghostty::surface::SurfaceIoMode::Exec);
+                let pane_id = alloc_pane_id();
+                // The realize callback creates the Ghostty surface and fills the leaf's handle.
+                let pane = crate::ghostty::surface::create_surface(
+                    app,
+                    ghostty_app,
+                    None,
+                    pane_id,
+                    crate::ghostty::surface::SurfaceIoMode::Exec,
+                );
                 // Phase 9: Attach right-click context menu (D-08)
-                attach_terminal_context_menu(&gl_area);
+                attach_terminal_context_menu(&pane.gl_area);
                 // D-06: preserve UUID from session
-                let uuid = *surface_uuid;
-                let surface_placeholder: ffi::ghostty_surface_t = std::ptr::null_mut();
                 Some(SplitNode::Leaf {
                     pane_id,
-                    gl_area,
-                    surface: surface_placeholder,
-                    uuid,
+                    gl_area: pane.gl_area,
+                    surface: pane.surface,
+                    ctx: pane.ctx,
+                    uuid: *surface_uuid,
                     has_attention: false,
                 })
             }
             SplitNodeData::Split { orientation, ratio, start, end } => {
-                let start_node = Self::node_from_data(app, ghostty_app, start, next_pane_id, depth + 1)?;
-                let end_node = Self::node_from_data(app, ghostty_app, end, next_pane_id, depth + 1)?;
+                let start_node = Self::node_from_data(app, ghostty_app, start, depth + 1)?;
+                let end_node = match Self::node_from_data(app, ghostty_app, end, depth + 1) {
+                    Some(n) => n,
+                    None => {
+                        teardown_leaves(&start_node);
+                        return None;
+                    }
+                };
                 let gtk_orientation = match orientation.as_str() {
                     "vertical" => gtk4::Orientation::Vertical,
                     _ => gtk4::Orientation::Horizontal,
@@ -453,30 +434,9 @@ impl SplitEngine {
         }
     }
 
-    /// Sync null surface pointers in the tree from GL_TO_SURFACE registry.
-    /// Called after restore to wire surfaces that were created during GLArea realize.
-    pub fn sync_surfaces_from_registry(&mut self) {
-        Self::sync_surfaces_recursive(&mut self.root);
-    }
-
-    fn sync_surfaces_recursive(node: &mut SplitNode) {
-        match node {
-            SplitNode::Leaf { gl_area, surface, .. } => {
-                if surface.is_null() {
-                    if let Ok(gl_to_surface) = crate::ghostty::callbacks::GL_TO_SURFACE.lock() {
-                        if let Some(&s) = gl_to_surface.get(&(gl_area.as_ptr() as usize)) {
-                            *surface = s as ffi::ghostty_surface_t;
-                        }
-                    }
-                }
-            }
-            SplitNode::Preview { .. } => {} // No surface to sync
-            SplitNode::Split { start, end, .. } => {
-                Self::sync_surfaces_recursive(start);
-                Self::sync_surfaces_recursive(end);
-            }
-        }
-    }
+    /// No-op. Surfaces are recorded in each leaf's handle by the GLArea realize callback, so
+    /// there is nothing to sync from the registry. Kept only because main.rs still calls it.
+    pub fn sync_surfaces_from_registry(&mut self) {}
 
     /// Returns the root widget of this workspace's split tree.
     pub fn root_widget(&self) -> gtk4::Widget {
@@ -504,24 +464,9 @@ impl SplitEngine {
         if let Some(gl_area) = self.find_gl_area(self.active_pane_id) {
             gl_area.grab_focus();
         }
-        // Call ghostty_surface_set_focus(true) on the active surface via registry lookup.
-        if let Ok(areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {
-            if let Ok(gl_to_surface) = crate::ghostty::callbacks::GL_TO_SURFACE.lock() {
-                for area_ptr in areas.iter() {
-                    let area: gtk4::glib::translate::Borrowed<gtk4::GLArea> =
-                        unsafe { gtk4::glib::translate::from_glib_borrow(area_ptr.0) };
-                    if area.has_css_class("active-pane") {
-                        if let Some(&surface_ptr) = gl_to_surface.get(&(area_ptr.0 as usize)) {
-                            unsafe {
-                                crate::ghostty::ffi::ghostty_surface_set_focus(
-                                    surface_ptr as ffi::ghostty_surface_t,
-                                    true,
-                                );
-                            }
-                        }
-                        break;
-                    }
-                }
+        if let Some(surface) = self.find_surface(self.active_pane_id) {
+            unsafe {
+                ffi::ghostty_surface_set_focus(surface, true);
             }
         }
         // Kick the render loop to repaint after focus restore.
@@ -552,8 +497,6 @@ impl SplitEngine {
 
     pub fn split_active(&mut self, orientation: gtk4::Orientation) -> Option<u64> {
         let active_id = self.active_pane_id;
-        let new_pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
 
         // When the root is a Leaf (first split), the GLArea is a direct child of the GtkStack
         // page. The replacer will remove it from the Stack (via remove_widget_from_parent) and
@@ -573,7 +516,7 @@ impl SplitEngine {
                 None
             };
 
-        // Find the active leaf's surface for inherited config.
+        // Find the active leaf's surface for inherited config. None if it is not realized yet.
         let inherited_surface = self.find_surface(active_id)?;
 
         // Unfocus the old surface before the split — Ghostty routes input by focus state,
@@ -594,11 +537,8 @@ impl SplitEngine {
         };
 
         // Create new GLArea + surface for the new pane.
-        eprintln!(
-            "cmux: split_active calling create_surface for new_pane_id={}",
-            new_pane_id
-        );
-        let (new_gl_area, _surface_cell) = crate::ghostty::surface::create_surface(
+        let new_pane_id = alloc_pane_id();
+        let pane = crate::ghostty::surface::create_surface(
             &self.app,
             self.ghostty_app,
             Some(inherited_config),
@@ -606,14 +546,15 @@ impl SplitEngine {
             crate::ghostty::surface::SurfaceIoMode::Exec,
         );
         // Phase 9: Attach right-click context menu (D-08)
-        attach_terminal_context_menu(&new_gl_area);
+        attach_terminal_context_menu(&pane.gl_area);
+        let new_gl_area = pane.gl_area.clone();
 
         // Replace the active leaf in the tree with a Split node.
-        let new_surface_placeholder: ffi::ghostty_surface_t = std::ptr::null_mut();
         let new_leaf = SplitNode::Leaf {
             pane_id: new_pane_id,
-            gl_area: new_gl_area.clone(),
-            surface: new_surface_placeholder, // updated after realize via SURFACE_REGISTRY
+            gl_area: pane.gl_area,
+            surface: pane.surface,
+            ctx: pane.ctx,
             uuid: Uuid::new_v4(),
             has_attention: false,
         };
@@ -638,20 +579,12 @@ impl SplitEngine {
         Some(new_pane_id)
     }
 
-    /// Allocate the next available pane ID (used by browser preview pane creation).
-    pub fn allocate_pane_id(&mut self) -> u64 {
-        let id = self.next_pane_id;
-        self.next_pane_id += 1;
-        id
-    }
-
     /// Split the active pane vertically and insert a Preview node on the right.
     /// Returns (new_pane_id, picture_widget, url_entry) so the caller can wire streaming and URL navigation.
     /// The active terminal pane stays on the left and retains focus.
     pub fn split_active_with_preview(&mut self) -> Option<crate::browser::PreviewPaneWidgets> {
         let active_id = self.active_pane_id;
-        let new_pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
+        let new_pane_id = alloc_pane_id();
 
         // Same stack re-parenting guard as split_active:
         // When root is a Leaf or Preview, capture the GtkStack parent so we can
@@ -796,18 +729,13 @@ impl SplitEngine {
                 // First try: controllers on the Paned itself
                 let controllers = paned.observe_controllers();
                 let n = controllers.n_items();
-                eprintln!("cmux: Paned has {} controllers", n);
                 for i in 0..n {
                     if let Some(obj) = controllers.item(i) {
-                        eprintln!("cmux:   controller[{}]: {}", i, obj.type_().name());
                         if let Ok(gesture) = obj.downcast::<gtk4::GestureDrag>() {
-                            eprintln!("cmux:   -> found GestureDrag on Paned, connecting drag-end");
                             gesture.connect_drag_end(|_gesture, _offset_x, _offset_y| {
-                                eprintln!("cmux: GestureDrag drag-end fired on Paned — deferring focus restore to idle");
                                 // Defer to idle so GTK has time to fully release the gesture
                                 // and clean up the event sequence before we move focus.
                                 gtk4::glib::idle_add_local_once(|| {
-                                    eprintln!("cmux: drag-end idle: restoring focus now");
                                     restore_active_pane_focus();
                                 });
                             });
@@ -821,26 +749,13 @@ impl SplitEngine {
                 if !found_gesture {
                     let mut child = paned.first_child();
                     while let Some(ref widget) = child {
-                        let type_name = widget.type_().name();
-                        eprintln!("cmux: Paned child: {}", type_name);
                         let ctrl_list = widget.observe_controllers();
                         let cn = ctrl_list.n_items();
                         for i in 0..cn {
                             if let Some(obj) = ctrl_list.item(i) {
-                                eprintln!(
-                                    "cmux:   child controller[{}]: {}",
-                                    i,
-                                    obj.type_().name()
-                                );
                                 if let Ok(gesture) = obj.downcast::<gtk4::GestureDrag>() {
-                                    eprintln!(
-                                        "cmux:   -> found GestureDrag on {}, connecting drag-end",
-                                        type_name
-                                    );
                                     gesture.connect_drag_end(|_gesture, _offset_x, _offset_y| {
-                                        eprintln!("cmux: GestureDrag drag-end fired on separator — deferring focus restore to idle");
                                         gtk4::glib::idle_add_local_once(|| {
-                                            eprintln!("cmux: separator drag-end idle: restoring focus now");
                                             restore_active_pane_focus();
                                         });
                                     });
@@ -885,65 +800,36 @@ impl SplitEngine {
         replace_in_tree(&mut self.root, target_pane_id, &mut replacer)
     }
 
-    /// Close the active pane (Ctrl+Shift+X per UI-SPEC).
-    /// Removes the active leaf, replaces its parent Split with the surviving sibling.
-    /// Returns the new active pane_id, or None if this was the last pane.
-    pub fn close_active(&mut self) -> Option<u64> {
-        let active_id = self.active_pane_id;
-
-        // Cannot close the last pane — workspace close is handled at AppState level.
-        let is_single_pane = match &self.root {
-            SplitNode::Leaf { pane_id, .. } if *pane_id == active_id => true,
-            SplitNode::Preview { pane_id, .. } if *pane_id == active_id => true,
-            _ => false,
+    /// Close one pane. If it was the active pane, focus moves to the surviving sibling.
+    /// The pane's surface and GL state are torn down before its widget leaves the tree.
+    pub fn close_pane(&mut self, target_id: u64) -> CloseResult {
+        let target_is_terminal = match self.root.find_node(target_id) {
+            Some(SplitNode::Leaf { .. }) => true,
+            Some(SplitNode::Preview { .. }) => false,
+            _ => return CloseResult::Failed,
         };
-        if is_single_pane {
-            return None; // Signal to AppState: close the workspace instead
+        // A root that is itself the pane is the workspace's only pane. The workspace closes instead.
+        if !matches!(self.root, SplitNode::Split { .. }) {
+            return CloseResult::LastPane;
+        }
+        // Never leave a workspace with only previews: the workspace closes instead.
+        if would_close_last_terminal(count_terminals(&self.root), target_is_terminal) {
+            return CloseResult::LastPane;
         }
 
-        // Don't close the last terminal pane if only a Preview would survive.
-        // A Preview-only workspace has no terminal and the Ghostty surface free
-        // can crash when no terminal remains to receive focus.
-        let terminal_count = count_terminals(&self.root);
-        let active_is_terminal = matches!(
-            self.root.find_node(active_id),
-            Some(SplitNode::Leaf { .. })
-        );
-        if active_is_terminal && terminal_count <= 1 {
-            return None; // Prevent closing last terminal; close workspace instead
+        // Tear down the surface and GL state while the widget is still in the tree.
+        if let Some(SplitNode::Leaf { gl_area, surface, ctx, .. }) = self.root.find_node(target_id) {
+            teardown_pane(gl_area, surface, *ctx);
         }
-
-        // Find the surface before removing it from the tree.
-        let surface_to_free = self.find_surface(active_id)?;
-
-        // Capture the raw GLArea pointer BEFORE the tree removal drops the GObject.
-        // GL_AREA_REGISTRY holds raw pointers; once GTK finalizes the GObject the
-        // pointer becomes dangling. Remove it here while the GLArea is still alive.
-        let raw_gl_area: Option<*mut gtk4::ffi::GtkGLArea> = self
-            .find_gl_area(active_id)
-            .map(|a| a.as_ptr() as *mut gtk4::ffi::GtkGLArea);
 
         // Remove the leaf from the tree and get the surviving sibling's pane_id.
-        let surviving_id = remove_leaf_from_tree(&mut self.root, active_id)?;
+        let Some(surviving_id) = remove_leaf_from_tree(&mut self.root, target_id) else {
+            return CloseResult::Failed;
+        };
 
-        // Remove the now-dropped GLArea from GL_AREA_REGISTRY before any further
-        // callbacks can dereference the dangling pointer (Gap 2 fix).
-        if let Some(raw_ptr) = raw_gl_area {
-            if let Ok(mut areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {
-                areas.retain(|p| p.0 != raw_ptr);
-            }
-            // Also remove from GL_TO_SURFACE mapping.
-            if let Ok(mut gl_to_surface) = crate::ghostty::callbacks::GL_TO_SURFACE.lock() {
-                gl_to_surface.remove(&(raw_ptr as usize));
-            }
-        }
-
-        // Deregister from SURFACE_REGISTRY and free the surface.
-        unsafe {
-            ffi::ghostty_surface_free(surface_to_free);
-        }
-        if let Ok(mut registry) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-            registry.remove(&(surface_to_free as usize));
+        if self.active_pane_id != target_id {
+            // Closing a background pane leaves focus where it was.
+            return CloseResult::Closed(self.active_pane_id);
         }
 
         // Update focus to the surviving pane.
@@ -964,7 +850,28 @@ impl SplitEngine {
             entry.grab_focus();
         }
 
-        Some(surviving_id)
+        CloseResult::Closed(surviving_id)
+    }
+
+    /// Compatibility wrapper for callers written before `CloseResult`: `Some(new active pane)`
+    /// when the active pane closed, `None` for the last pane or a failure. Prefer `close_pane`,
+    /// which tells those two apart.
+    pub fn close_active(&mut self) -> Option<u64> {
+        match self.close_pane(self.active_pane_id) {
+            CloseResult::Closed(id) => Some(id),
+            CloseResult::LastPane | CloseResult::Failed => None,
+        }
+    }
+
+    /// Tears down every pane's surface and GL state. Call before the workspace's widgets are
+    /// removed. The engine must not render or focus anything afterwards.
+    pub fn teardown_all(&self) {
+        teardown_leaves(&self.root);
+    }
+
+    /// Returns true if `pane_id` is a pane (terminal or preview) in this workspace.
+    pub fn contains_pane(&self, pane_id: u64) -> bool {
+        self.root.find_node(pane_id).is_some()
     }
 
     /// Navigate focus to the pane adjacent in `direction` (Ctrl+Alt+arrows per D-10).
@@ -996,24 +903,9 @@ impl SplitEngine {
         }
     }
 
-    /// Update the surface pointer for a pane after its GLArea realize callback fires.
-    /// Called by Plan 04 wiring after SURFACE_REGISTRY is populated.
-    pub fn update_surface(&mut self, pane_id: u64, surface: ffi::ghostty_surface_t) {
-        update_surface_in_tree(&mut self.root, pane_id, surface);
-    }
-
+    /// The pane's live surface, read through its handle. None before realize and after teardown.
     fn find_surface(&self, pane_id: u64) -> Option<ffi::ghostty_surface_t> {
-        find_surface_in_tree(&self.root, pane_id).or_else(|| {
-            // Fallback: look up in global SURFACE_REGISTRY by scanning for pane_id.
-            // SURFACE_REGISTRY maps surface_ptr (usize) → pane_id; need reverse lookup.
-            if let Ok(reg) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                reg.iter()
-                    .find(|(_, &pid)| pid == pane_id)
-                    .map(|(&ptr, _)| ptr as ffi::ghostty_surface_t)
-            } else {
-                None
-            }
-        })
+        find_surface_in_tree(&self.root, pane_id)
     }
 
     fn find_gl_area(&self, pane_id: u64) -> Option<gtk4::GLArea> {
@@ -1059,7 +951,8 @@ where
                     SplitNode::Leaf {
                         pane_id: 0,
                         gl_area: gtk4::GLArea::new(),
-                        surface: std::ptr::null_mut(),
+                        surface: Rc::new(RefCell::new(None)),
+                        ctx: std::ptr::null_mut(),
                         uuid: Uuid::new_v4(),
                         has_attention: false,
                     },
@@ -1159,6 +1052,8 @@ fn replace_child_in_parent(
     new_widget: &gtk4::Widget,
 ) {
     if let Some(paned) = parent.downcast_ref::<gtk4::Paned>() {
+        // new_widget is still parented to the Paned being replaced; unparent it first.
+        remove_widget_from_parent(new_widget);
         if paned
             .start_child()
             .as_ref()
@@ -1199,13 +1094,7 @@ fn find_surface_in_tree(node: &SplitNode, pane_id: u64) -> Option<ffi::ghostty_s
             pane_id: id,
             surface,
             ..
-        } if *id == pane_id => {
-            if surface.is_null() {
-                None
-            } else {
-                Some(*surface)
-            }
-        }
+        } if *id == pane_id => *surface.borrow(),
         SplitNode::Leaf { .. } => None,
         SplitNode::Preview { .. } => None, // No Ghostty surface
         SplitNode::Split { start, end, .. } => {
@@ -1238,28 +1127,30 @@ fn count_terminals(node: &SplitNode) -> usize {
     }
 }
 
+/// Tears down every leaf's surface and GL state in a subtree. Each leaf is torn down once.
+fn teardown_leaves(node: &SplitNode) {
+    match node {
+        SplitNode::Leaf { gl_area, surface, ctx, .. } => teardown_pane(gl_area, surface, *ctx),
+        SplitNode::Preview { .. } => {}
+        SplitNode::Split { start, end, .. } => {
+            teardown_leaves(start);
+            teardown_leaves(end);
+        }
+    }
+}
+
+/// Closing a pane is refused when it is the workspace's last terminal: the workspace must
+/// close instead, so a workspace is never left with only preview panes.
+fn would_close_last_terminal(terminal_count: usize, target_is_terminal: bool) -> bool {
+    target_is_terminal && terminal_count <= 1
+}
+
 fn find_url_entry_in_tree(node: &SplitNode, pane_id: u64) -> Option<gtk4::Entry> {
     match node {
         SplitNode::Preview { pane_id: id, url_entry, .. } if *id == pane_id => Some(url_entry.clone()),
         SplitNode::Preview { .. } | SplitNode::Leaf { .. } => None,
         SplitNode::Split { start, end, .. } => {
             find_url_entry_in_tree(start, pane_id).or_else(|| find_url_entry_in_tree(end, pane_id))
-        }
-    }
-}
-
-fn update_surface_in_tree(node: &mut SplitNode, pane_id: u64, surface: ffi::ghostty_surface_t) {
-    match node {
-        SplitNode::Leaf {
-            pane_id: id,
-            surface: s,
-            ..
-        } if *id == pane_id => *s = surface,
-        SplitNode::Leaf { .. } => {}
-        SplitNode::Preview { .. } => {} // No surface to update
-        SplitNode::Split { start, end, .. } => {
-            update_surface_in_tree(start, pane_id, surface);
-            update_surface_in_tree(end, pane_id, surface);
         }
     }
 }
@@ -1441,12 +1332,32 @@ fn default_ratio() -> f64 {
     0.5
 }
 
+/// Combines the session data of a split's two children. A child that is missing (a preview
+/// pane, which is not saved) collapses the split into the other child.
+fn combine_split(
+    orientation: String,
+    ratio: f64,
+    start: Option<SplitNodeData>,
+    end: Option<SplitNodeData>,
+) -> Option<SplitNodeData> {
+    match (start, end) {
+        (Some(start), Some(end)) => Some(SplitNodeData::Split {
+            orientation,
+            ratio,
+            start: Box::new(start),
+            end: Box::new(end),
+        }),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
 /// Best-effort CWD capture for a Ghostty surface via /proc.
 /// Walks /proc looking for child processes of the current process (cmux),
 /// then reads /proc/{pid}/cwd for the foreground shell.
 /// Never panics — falls back to $HOME or empty string.
-fn get_surface_cwd(surface: ffi::ghostty_surface_t) -> String {
-    if surface.is_null() {
+fn get_surface_cwd(surface: Option<ffi::ghostty_surface_t>) -> String {
+    if surface.is_none() {
         return String::new();
     }
     // Try to find child shell processes by scanning /proc for children of our PID.
@@ -1492,31 +1403,21 @@ fn get_surface_cwd(surface: ffi::ghostty_surface_t) -> String {
 }
 
 impl SplitNode {
-    /// Produce a serializable snapshot of this node's tree structure.
-    /// `shell` and `cwd` are best-effort: Plan 05 fills these via /proc.
-    /// Falls back to empty strings if /proc is unavailable or the pid is unknown.
-    pub fn to_data(&self) -> SplitNodeData {
+    /// Session snapshot of this subtree. Preview panes are ephemeral and are skipped; a split
+    /// left with one child collapses to that child. Returns None when no terminal is left.
+    pub fn to_session_data(&self) -> Option<SplitNodeData> {
         match self {
             SplitNode::Leaf { pane_id, uuid, surface, .. } => {
-                let cwd = get_surface_cwd(*surface);
+                let cwd = get_surface_cwd(*surface.borrow());
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-                SplitNodeData::Leaf {
+                Some(SplitNodeData::Leaf {
                     pane_id: *pane_id,
                     surface_uuid: *uuid,
                     shell,
                     cwd,
-                }
-            },
-            SplitNode::Preview { .. } => {
-                // Preview panes are ephemeral; skip in session serialization.
-                // Return a dummy leaf that will be ignored during restore.
-                SplitNodeData::Leaf {
-                    pane_id: 0,
-                    surface_uuid: Uuid::nil(),
-                    shell: String::new(),
-                    cwd: String::new(),
-                }
-            },
+                })
+            }
+            SplitNode::Preview { .. } => None,
             SplitNode::Split { orientation, paned, start, end, .. } => {
                 let total_size = if *orientation == gtk4::Orientation::Horizontal {
                     paned.width()
@@ -1528,24 +1429,46 @@ impl SplitNode {
                 } else {
                     0.5 // default if not yet laid out
                 };
-                SplitNodeData::Split {
-                    orientation: match orientation {
-                        gtk4::Orientation::Horizontal => "horizontal".to_string(),
-                        gtk4::Orientation::Vertical => "vertical".to_string(),
-                        _ => "horizontal".to_string(),
-                    },
+                let orientation = match orientation {
+                    gtk4::Orientation::Horizontal => "horizontal".to_string(),
+                    gtk4::Orientation::Vertical => "vertical".to_string(),
+                    _ => "horizontal".to_string(),
+                };
+                combine_split(
+                    orientation,
                     ratio,
-                    start: Box::new(start.to_data()),
-                    end: Box::new(end.to_data()),
-                }
-            },
+                    start.to_session_data(),
+                    end.to_session_data(),
+                )
+            }
         }
+    }
+
+    /// Serialized tree, with a placeholder leaf if no terminal is left. A workspace always keeps
+    /// at least one terminal, so the placeholder does not occur in practice. Prefer
+    /// `to_session_data` where a missing value can be handled.
+    pub fn to_data(&self) -> SplitNodeData {
+        self.to_session_data().unwrap_or_else(|| SplitNodeData::Leaf {
+            pane_id: 0,
+            surface_uuid: Uuid::nil(),
+            shell: String::new(),
+            cwd: String::new(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leaf_data(pane_id: u64) -> SplitNodeData {
+        SplitNodeData::Leaf {
+            pane_id,
+            surface_uuid: Uuid::new_v4(),
+            shell: String::new(),
+            cwd: String::new(),
+        }
+    }
 
     #[test]
     fn split_node_data_leaf_has_surface_uuid() {
@@ -1624,5 +1547,44 @@ mod tests {
         } else {
             panic!("v1 deserialize changed variant");
         }
+    }
+
+    #[test]
+    fn pane_ids_are_unique() {
+        let ids: std::collections::HashSet<u64> = (0..1000).map(|_| alloc_pane_id()).collect();
+        assert_eq!(ids.len(), 1000, "pane id allocation returned a duplicate");
+        assert!(!ids.contains(&0), "0 is reserved for 'no pane'");
+    }
+
+    #[test]
+    fn split_with_missing_child_collapses_to_other_child() {
+        let collapsed = combine_split("horizontal".into(), 0.5, Some(leaf_data(1)), None);
+        assert!(matches!(collapsed, Some(SplitNodeData::Leaf { pane_id: 1, .. })));
+
+        let collapsed = combine_split("horizontal".into(), 0.5, None, Some(leaf_data(2)));
+        assert!(matches!(collapsed, Some(SplitNodeData::Leaf { pane_id: 2, .. })));
+
+        assert!(combine_split("horizontal".into(), 0.5, None, None).is_none());
+
+        match combine_split("vertical".into(), 0.25, Some(leaf_data(1)), Some(leaf_data(2))) {
+            Some(SplitNodeData::Split { orientation, ratio, start, end }) => {
+                assert_eq!(orientation, "vertical");
+                assert!((ratio - 0.25).abs() < f64::EPSILON);
+                assert!(matches!(*start, SplitNodeData::Leaf { pane_id: 1, .. }));
+                assert!(matches!(*end, SplitNodeData::Leaf { pane_id: 2, .. }));
+            }
+            other => panic!("expected a split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_terminal_close_is_refused() {
+        // Closing the only terminal must hand off to the workspace close.
+        assert!(would_close_last_terminal(1, true));
+        // Two terminals: closing one is fine.
+        assert!(!would_close_last_terminal(2, true));
+        // Closing a preview while one terminal remains is fine.
+        assert!(!would_close_last_terminal(1, false));
+        assert!(!would_close_last_terminal(0, false));
     }
 }

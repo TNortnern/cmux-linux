@@ -1,11 +1,18 @@
 use crate::ghostty::ffi;
-use crate::split_engine::SplitEngine;
+use crate::split_engine::{alloc_pane_id, CloseResult, SplitEngine};
 use crate::workspace::{ConnectionState, Workspace};
+use gtk4::glib;
 use gtk4::prelude::*;
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 pub type AppStateRef = Rc<RefCell<AppState>>;
+
+thread_local! {
+    /// The app's AppState, for callbacks that only carry a pane id (ghostty's close callback).
+    /// Set by AppState::new. Main thread only.
+    static APP_STATE: RefCell<Weak<RefCell<AppState>>> = RefCell::new(Weak::new());
+}
 
 pub struct AppState {
     pub split_engines: Vec<SplitEngine>,
@@ -77,11 +84,13 @@ impl AppState {
             browser_surface_counter: 0,
             browser_surface_refs: std::collections::HashMap::new(),
         };
-        Rc::new(RefCell::new(state))
+        let rc = Rc::new(RefCell::new(state));
+        APP_STATE.with(|slot| *slot.borrow_mut() = Rc::downgrade(&rc));
+        rc
     }
 
-    /// Create a new workspace. Allocates an ID, creates a sidebar row, and adds a placeholder
-    /// page to the GtkStack. The actual GLArea/split root is added by the caller (Plan 04).
+    /// Create a new workspace with one terminal pane. Allocates an ID, creates the pane's
+    /// surface, adds a sidebar row, and adds the workspace page to the GtkStack.
     /// Returns the new workspace id.
     pub fn create_workspace(&mut self) -> u64 {
         let id = self.next_id;
@@ -92,6 +101,17 @@ impl AppState {
         let mut workspace = Workspace::new(id, display_number);
         let name = workspace.name.clone();
 
+        // Build the pane first: nothing is added to the sidebar or stack until it exists.
+        let pane_id = alloc_pane_id();
+        let pane = crate::ghostty::surface::create_surface(
+            &self.gtk_app,
+            self.ghostty_app,
+            None,
+            pane_id,
+            crate::ghostty::surface::SurfaceIoMode::Exec,
+        );
+        let engine = SplitEngine::new(self.gtk_app.clone(), self.ghostty_app, pane, pane_id);
+
         // Phase 9: Use shared row builder for consistent layout including close button
         let hbox = crate::sidebar::rebuild_sidebar_row_content(&name);
 
@@ -101,22 +121,6 @@ impl AppState {
             row.set_data("workspace-id", id);
         }
         self.sidebar_list.append(&row);
-
-        // Create surface and split engine
-        let pane_id = id * 1000;
-        eprintln!(
-            "cmux: create_workspace calling create_surface for workspace_id={}, pane_id={}",
-            id, pane_id
-        );
-        let (gl_area, surface_cell) =
-            crate::ghostty::surface::create_surface(&self.gtk_app, self.ghostty_app, None, pane_id, crate::ghostty::surface::SurfaceIoMode::Exec);
-        let engine = SplitEngine::new(
-            self.gtk_app.clone(),
-            self.ghostty_app,
-            gl_area.clone(),
-            surface_cell,
-            pane_id,
-        );
 
         // Add to stack
         let page_name = format!("workspace-{}", id);
@@ -135,9 +139,18 @@ impl AppState {
     }
 
     /// Restore a workspace from a session snapshot (SESS-02).
-    /// Creates sidebar row, uses SplitEngine::from_data() for full tree restore.
+    /// Builds the split tree first, then adds the sidebar row and stack page, so a tree that
+    /// fails to build leaves the sidebar and workspace indexes unchanged.
     /// Returns the workspace id, or None if tree is invalid (D-14 depth limit).
     pub fn restore_workspace(&mut self, ws: &crate::session::WorkspaceSession) -> Option<u64> {
+        // Build split tree from session data (D-05)
+        let engine = SplitEngine::from_data(
+            self.gtk_app.clone(),
+            self.ghostty_app,
+            &ws.layout,
+            ws.active_pane_uuid.as_deref(),
+        )?;
+
         let id = self.next_id;
         self.next_id += 1;
         let display_number = self.next_display_number;
@@ -154,14 +167,6 @@ impl AppState {
         unsafe { row.set_data("workspace-id", id); }
         self.sidebar_list.append(&row);
 
-        // Build split tree from session data (D-05)
-        let engine = crate::split_engine::SplitEngine::from_data(
-            self.gtk_app.clone(),
-            self.ghostty_app,
-            &ws.layout,
-            ws.active_pane_uuid.as_deref(),
-        )?;
-
         // Add to stack
         let page_name = format!("workspace-{}", id);
         self.stack.add_named(&engine.root_widget(), Some(&page_name));
@@ -173,7 +178,7 @@ impl AppState {
         Some(id)
     }
 
-    /// Build a sidebar row for a workspace. Used by create_workspace and create_remote_workspace.
+    /// Build a sidebar row for a workspace. Used by create_remote_workspace.
     fn build_sidebar_row(&self, workspace: &Workspace) -> gtk4::ListBoxRow {
         let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -220,11 +225,9 @@ impl AppState {
         self.next_display_number += 1;
 
         let workspace = Workspace::new_remote(id, display_number, target);
-        let row = self.build_sidebar_row(&workspace);
-        self.sidebar_list.append(&row);
 
         // Create remote surface with manual I/O mode
-        let pane_id = id * 1000;
+        let pane_id = alloc_pane_id();
         let io_ctx = std::sync::Arc::new(crate::ssh::bridge::IoWriteContext {
             pane_id,
             write_tx: bridge.clone_write_tx(),
@@ -232,20 +235,17 @@ impl AppState {
             eof_received: std::sync::atomic::AtomicBool::new(false),
             ssh_tx: self.ssh_event_tx.clone().expect("ssh_event_tx must be set before creating remote workspaces"),
         });
-        let (gl_area, surface_cell) = crate::ghostty::surface::create_surface(
+        let pane = crate::ghostty::surface::create_surface(
             &self.gtk_app,
             self.ghostty_app,
             None,
             pane_id,
             crate::ghostty::surface::SurfaceIoMode::Manual { io_write_ctx: io_ctx.clone() },
         );
-        let engine = SplitEngine::new(
-            self.gtk_app.clone(),
-            self.ghostty_app,
-            gl_area,
-            surface_cell,
-            pane_id,
-        );
+        let engine = SplitEngine::new(self.gtk_app.clone(), self.ghostty_app, pane, pane_id);
+
+        let row = self.build_sidebar_row(&workspace);
+        self.sidebar_list.append(&row);
 
         let page_name = workspace.stack_page_name.clone();
         self.stack
@@ -291,11 +291,10 @@ impl AppState {
         }
     }
 
-    /// Close the workspace at `index`. Removes the sidebar row and GtkStack page.
-    /// Returns false if there is only one workspace (cannot close the last one).
-    /// The caller (Plan 04) is responsible for calling ghostty_surface_free on all panes first.
+    /// Close the workspace at `index`. Tears down its panes, then removes the sidebar row and
+    /// GtkStack page. Returns false if there is only one workspace (cannot close the last one).
     pub fn close_workspace(&mut self, index: usize) -> bool {
-        if self.workspaces.len() <= 1 {
+        if self.workspaces.len() <= 1 || index >= self.workspaces.len() {
             return false; // Cannot close the last workspace
         }
 
@@ -306,20 +305,9 @@ impl AppState {
             }
         }
 
-        // Before removing from workspaces, free all Ghostty surfaces in the split engine.
+        // Tear down every pane's surface and GL state before any widget is removed.
         if let Some(engine) = self.split_engines.get(index) {
-            let mut surfaces = Vec::new();
-            engine.root.collect_surfaces(&mut surfaces);
-            for surface in surfaces {
-                if !surface.is_null() {
-                    unsafe {
-                        crate::ghostty::ffi::ghostty_surface_free(surface);
-                    }
-                    if let Ok(mut reg) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                        reg.remove(&(surface as usize));
-                    }
-                }
-            }
+            engine.teardown_all();
         }
         self.split_engines.remove(index);
 
@@ -345,6 +333,23 @@ impl AppState {
         self.switch_to_index(self.active_index);
         self.trigger_session_save();
         true
+    }
+
+    /// Close one pane, e.g. because its shell exited. Closing the last pane of a workspace
+    /// closes the workspace. Returns true if the pane was closed. A workspace that is the
+    /// last one open keeps its final pane.
+    pub fn close_pane(&mut self, pane_id: u64) -> bool {
+        let Some(idx) = self.split_engines.iter().position(|e| e.contains_pane(pane_id)) else {
+            return false;
+        };
+        match self.split_engines[idx].close_pane(pane_id) {
+            CloseResult::Closed(_) => {
+                self.trigger_session_save();
+                true
+            }
+            CloseResult::LastPane => self.close_workspace(idx),
+            CloseResult::Failed => false,
+        }
     }
 
     /// Switch to the workspace at `index` (0-based). Updates GtkStack visible child and
@@ -548,6 +553,21 @@ impl AppState {
             notify.notify_one();
         }
     }
+}
+
+/// Closes a pane whose surface ghostty asked to close (the shell exited).
+/// Called from an idle callback on the GLib main thread, never from inside ghostty_app_tick.
+/// Does nothing if the app state is busy or the pane is already gone.
+pub fn close_pane_request(pane_id: u64) {
+    let Some(state) = APP_STATE.with(|slot| slot.borrow().upgrade()) else {
+        return;
+    };
+    let Ok(mut s) = state.try_borrow_mut() else {
+        // Something holds the state right now; try again on a later idle.
+        glib::idle_add_local_once(move || close_pane_request(pane_id));
+        return;
+    };
+    s.close_pane(pane_id);
 }
 
 /// Send a desktop notification for a bell in the given workspace.
