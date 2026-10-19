@@ -1111,6 +1111,18 @@ impl AppState {
             cmux_warn!("session flush failed: {e}");
         }
     }
+
+    /// Starts inline renaming of the selected tab of the active workspace (Ctrl+Shift+R).
+    pub fn begin_active_tab_rename(&mut self) {
+        let Some(ws) = self.workspaces.get(self.active_index) else {
+            return;
+        };
+        let Some(tab) = ws.tabs.get(ws.active_tab) else {
+            return;
+        };
+        let (ws_id, tab_id) = (ws.id, tab.id);
+        self.begin_tab_rename(ws_id, tab_id);
+    }
 }
 
 /// Closes a pane whose surface ghostty asked to close (the shell exited).

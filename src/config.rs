@@ -49,24 +49,38 @@ impl Default for TerminalConfig {
     }
 }
 
-/// Per-action shortcut overrides. Each value is a GTK accelerator string (e.g. "<Ctrl>n").
-/// None means "use default".
+/// Per-action shortcut overrides. Each value is a GTK accelerator string (e.g. "<Ctrl><Shift>t").
+/// None means "use default". The defaults are the Windows Terminal style map in the README.
 #[derive(serde::Deserialize, Default, Debug)]
 pub struct ShortcutConfig {
-    pub new_workspace: Option<String>,
-    pub close_workspace: Option<String>,
-    pub next_workspace: Option<String>,
-    pub prev_workspace: Option<String>,
-    pub rename_workspace: Option<String>,
-    pub toggle_sidebar: Option<String>,
+    pub new_tab: Option<String>,
+    pub close_pane: Option<String>,
+    pub next_tab: Option<String>,
+    pub prev_tab: Option<String>,
+    pub tab_1: Option<String>,
+    pub tab_2: Option<String>,
+    pub tab_3: Option<String>,
+    pub tab_4: Option<String>,
+    pub tab_5: Option<String>,
+    pub tab_6: Option<String>,
+    pub tab_7: Option<String>,
+    pub tab_8: Option<String>,
+    pub last_tab: Option<String>,
+    pub rename_tab: Option<String>,
     pub split_right: Option<String>,
     pub split_down: Option<String>,
-    pub close_pane: Option<String>,
-    pub new_ssh_workspace: Option<String>,
+    pub split_auto: Option<String>,
     pub focus_left: Option<String>,
     pub focus_right: Option<String>,
     pub focus_up: Option<String>,
     pub focus_down: Option<String>,
+    pub resize_left: Option<String>,
+    pub resize_right: Option<String>,
+    pub resize_up: Option<String>,
+    pub resize_down: Option<String>,
+    pub zoom_pane: Option<String>,
+    pub equalize: Option<String>,
+    pub new_workspace: Option<String>,
     pub workspace_1: Option<String>,
     pub workspace_2: Option<String>,
     pub workspace_3: Option<String>,
@@ -76,6 +90,11 @@ pub struct ShortcutConfig {
     pub workspace_7: Option<String>,
     pub workspace_8: Option<String>,
     pub workspace_9: Option<String>,
+    pub toggle_sidebar: Option<String>,
+    pub find: Option<String>,
+    pub new_ssh_workspace: Option<String>,
+    pub preferences: Option<String>,
+    pub quit: Option<String>,
     pub browser_open: Option<String>,
     pub browser_close: Option<String>,
 }
@@ -135,20 +154,34 @@ impl Default for HeaderBarConfig {
 /// All bindable shortcut actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutAction {
-    NewWorkspace,
-    CloseWorkspace,
-    NextWorkspace,
-    PrevWorkspace,
-    RenameWorkspace,
-    ToggleSidebar,
+    NewTab,
+    ClosePane,
+    NextTab,
+    PrevTab,
+    Tab1,
+    Tab2,
+    Tab3,
+    Tab4,
+    Tab5,
+    Tab6,
+    Tab7,
+    Tab8,
+    LastTab,
+    RenameTab,
     SplitRight,
     SplitDown,
-    ClosePane,
-    NewSshWorkspace,
+    SplitAuto,
     FocusLeft,
     FocusRight,
     FocusUp,
     FocusDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    ZoomPane,
+    Equalize,
+    NewWorkspace,
     Workspace1,
     Workspace2,
     Workspace3,
@@ -158,6 +191,11 @@ pub enum ShortcutAction {
     Workspace7,
     Workspace8,
     Workspace9,
+    ToggleSidebar,
+    Find,
+    NewSshWorkspace,
+    Preferences,
+    Quit,
     BrowserOpen,
     BrowserClose,
 }
@@ -169,12 +207,25 @@ pub struct ShortcutMap {
 
 /// Known shortcut action names for unknown-key detection.
 const KNOWN_SHORTCUTS: &[&str] = &[
-    "new_workspace", "close_workspace", "next_workspace", "prev_workspace",
-    "rename_workspace", "toggle_sidebar", "split_right", "split_down",
-    "close_pane", "new_ssh_workspace", "focus_left", "focus_right", "focus_up", "focus_down",
-    "workspace_1", "workspace_2", "workspace_3", "workspace_4",
-    "workspace_5", "workspace_6", "workspace_7", "workspace_8", "workspace_9",
+    "new_tab", "close_pane", "next_tab", "prev_tab",
+    "tab_1", "tab_2", "tab_3", "tab_4", "tab_5", "tab_6", "tab_7", "tab_8", "last_tab",
+    "rename_tab", "split_right", "split_down", "split_auto",
+    "focus_left", "focus_right", "focus_up", "focus_down",
+    "resize_left", "resize_right", "resize_up", "resize_down",
+    "zoom_pane", "equalize", "new_workspace",
+    "workspace_1", "workspace_2", "workspace_3", "workspace_4", "workspace_5",
+    "workspace_6", "workspace_7", "workspace_8", "workspace_9",
+    "toggle_sidebar", "find", "new_ssh_workspace", "preferences", "quit",
     "browser_open", "browser_close",
+];
+
+/// Extra accelerators that also trigger an action with its default binding. They cover the
+/// keysym a layout reports for the same key, e.g. Shift+Tab is ISO_Left_Tab in GDK. An action
+/// whose binding is overridden in config loses its alternates.
+const ALTERNATE_DEFAULTS: &[(ShortcutAction, &str)] = &[
+    (ShortcutAction::PrevTab, "<Ctrl><Shift>Tab"),
+    (ShortcutAction::SplitRight, "<Alt><Shift>equal"),
+    (ShortcutAction::SplitDown, "<Alt><Shift>minus"),
 ];
 
 /// Modifier mask for lookup: ignore Caps Lock, Num Lock, etc.
@@ -292,31 +343,50 @@ impl ShortcutMap {
     /// Build lookup table from config, falling back to defaults for unset/invalid entries.
     pub fn from_config(config: &ShortcutConfig) -> Self {
         let entries: &[(ShortcutAction, &Option<String>, &str)] = &[
-            (ShortcutAction::NewWorkspace,    &config.new_workspace,    "<Ctrl>n"),
-            (ShortcutAction::CloseWorkspace,  &config.close_workspace,  "<Ctrl><Shift>w"),
-            (ShortcutAction::NextWorkspace,   &config.next_workspace,   "<Ctrl>bracketright"),
-            (ShortcutAction::PrevWorkspace,   &config.prev_workspace,   "<Ctrl>bracketleft"),
-            (ShortcutAction::RenameWorkspace, &config.rename_workspace, "<Ctrl><Shift>r"),
-            (ShortcutAction::ToggleSidebar,   &config.toggle_sidebar,   "<Ctrl>b"),
-            (ShortcutAction::SplitRight,      &config.split_right,      "<Ctrl>d"),
-            (ShortcutAction::SplitDown,       &config.split_down,       "<Ctrl><Shift>d"),
-            (ShortcutAction::ClosePane,       &config.close_pane,       "<Ctrl><Shift>x"),
+            (ShortcutAction::NewTab,          &config.new_tab,          "<Ctrl><Shift>t"),
+            (ShortcutAction::ClosePane,       &config.close_pane,       "<Ctrl><Shift>w"),
+            (ShortcutAction::NextTab,         &config.next_tab,         "<Ctrl>Tab"),
+            (ShortcutAction::PrevTab,         &config.prev_tab,         "<Ctrl><Shift>ISO_Left_Tab"),
+            (ShortcutAction::Tab1,            &config.tab_1,            "<Ctrl>1"),
+            (ShortcutAction::Tab2,            &config.tab_2,            "<Ctrl>2"),
+            (ShortcutAction::Tab3,            &config.tab_3,            "<Ctrl>3"),
+            (ShortcutAction::Tab4,            &config.tab_4,            "<Ctrl>4"),
+            (ShortcutAction::Tab5,            &config.tab_5,            "<Ctrl>5"),
+            (ShortcutAction::Tab6,            &config.tab_6,            "<Ctrl>6"),
+            (ShortcutAction::Tab7,            &config.tab_7,            "<Ctrl>7"),
+            (ShortcutAction::Tab8,            &config.tab_8,            "<Ctrl>8"),
+            (ShortcutAction::LastTab,         &config.last_tab,         "<Ctrl>9"),
+            (ShortcutAction::RenameTab,       &config.rename_tab,       "<Ctrl><Shift>r"),
+            (ShortcutAction::SplitRight,      &config.split_right,      "<Alt><Shift>plus"),
+            (ShortcutAction::SplitDown,       &config.split_down,       "<Alt><Shift>underscore"),
+            (ShortcutAction::SplitAuto,       &config.split_auto,       "<Alt><Shift>d"),
+            (ShortcutAction::FocusLeft,       &config.focus_left,       "<Alt>Left"),
+            (ShortcutAction::FocusRight,      &config.focus_right,      "<Alt>Right"),
+            (ShortcutAction::FocusUp,         &config.focus_up,         "<Alt>Up"),
+            (ShortcutAction::FocusDown,       &config.focus_down,       "<Alt>Down"),
+            (ShortcutAction::ResizeLeft,      &config.resize_left,      "<Alt><Shift>Left"),
+            (ShortcutAction::ResizeRight,     &config.resize_right,     "<Alt><Shift>Right"),
+            (ShortcutAction::ResizeUp,        &config.resize_up,        "<Alt><Shift>Up"),
+            (ShortcutAction::ResizeDown,      &config.resize_down,      "<Alt><Shift>Down"),
+            (ShortcutAction::ZoomPane,        &config.zoom_pane,        "<Ctrl><Shift>z"),
+            (ShortcutAction::Equalize,        &config.equalize,         "<Ctrl><Shift>e"),
+            (ShortcutAction::NewWorkspace,    &config.new_workspace,    "<Ctrl><Shift>n"),
+            (ShortcutAction::Workspace1,      &config.workspace_1,      "<Ctrl><Alt>1"),
+            (ShortcutAction::Workspace2,      &config.workspace_2,      "<Ctrl><Alt>2"),
+            (ShortcutAction::Workspace3,      &config.workspace_3,      "<Ctrl><Alt>3"),
+            (ShortcutAction::Workspace4,      &config.workspace_4,      "<Ctrl><Alt>4"),
+            (ShortcutAction::Workspace5,      &config.workspace_5,      "<Ctrl><Alt>5"),
+            (ShortcutAction::Workspace6,      &config.workspace_6,      "<Ctrl><Alt>6"),
+            (ShortcutAction::Workspace7,      &config.workspace_7,      "<Ctrl><Alt>7"),
+            (ShortcutAction::Workspace8,      &config.workspace_8,      "<Ctrl><Alt>8"),
+            (ShortcutAction::Workspace9,      &config.workspace_9,      "<Ctrl><Alt>9"),
+            (ShortcutAction::ToggleSidebar,   &config.toggle_sidebar,   "<Ctrl><Shift>b"),
+            (ShortcutAction::Find,            &config.find,            "<Ctrl><Shift>f"),
             (ShortcutAction::NewSshWorkspace, &config.new_ssh_workspace, "<Ctrl><Shift>s"),
-            (ShortcutAction::FocusLeft,       &config.focus_left,       "<Ctrl><Shift>Left"),
-            (ShortcutAction::FocusRight,      &config.focus_right,      "<Ctrl><Shift>Right"),
-            (ShortcutAction::FocusUp,         &config.focus_up,         "<Ctrl><Shift>Up"),
-            (ShortcutAction::FocusDown,       &config.focus_down,       "<Ctrl><Shift>Down"),
-            (ShortcutAction::Workspace1,      &config.workspace_1,      "<Ctrl>1"),
-            (ShortcutAction::Workspace2,      &config.workspace_2,      "<Ctrl>2"),
-            (ShortcutAction::Workspace3,      &config.workspace_3,      "<Ctrl>3"),
-            (ShortcutAction::Workspace4,      &config.workspace_4,      "<Ctrl>4"),
-            (ShortcutAction::Workspace5,      &config.workspace_5,      "<Ctrl>5"),
-            (ShortcutAction::Workspace6,      &config.workspace_6,      "<Ctrl>6"),
-            (ShortcutAction::Workspace7,      &config.workspace_7,      "<Ctrl>7"),
-            (ShortcutAction::Workspace8,      &config.workspace_8,      "<Ctrl>8"),
-            (ShortcutAction::Workspace9,      &config.workspace_9,      "<Ctrl>9"),
-            (ShortcutAction::BrowserOpen,     &config.browser_open,     "<Ctrl><Shift>b"),
-            (ShortcutAction::BrowserClose,    &config.browser_close,    "<Ctrl><Shift>q"),
+            (ShortcutAction::Preferences,     &config.preferences,      "<Ctrl>comma"),
+            (ShortcutAction::Quit,            &config.quit,             "<Ctrl><Shift>q"),
+            (ShortcutAction::BrowserOpen,     &config.browser_open,     "<Ctrl><Alt>b"),
+            (ShortcutAction::BrowserClose,    &config.browser_close,    "<Ctrl><Alt><Shift>b"),
         ];
 
         let mut map = HashMap::new();
@@ -334,6 +404,18 @@ impl ShortcutMap {
                     accel_str, action_name, default_accel
                 );
                 if let Some((key, mods)) = gtk4::accelerator_parse(*default_accel) {
+                    map.insert((mods & MOD_MASK, key), *action);
+                }
+            }
+        }
+
+        // Alternate keysyms for the defaults. Skipped for actions the config rebinds.
+        for (action, config_val, _) in entries {
+            if config_val.is_some() {
+                continue;
+            }
+            for (_, alt) in ALTERNATE_DEFAULTS.iter().filter(|(a, _)| a == action) {
+                if let Some((key, mods)) = gtk4::accelerator_parse(*alt) {
                     map.insert((mods & MOD_MASK, key), *action);
                 }
             }
@@ -388,7 +470,7 @@ mod tests {
         // A path that does not exist: load_config_from returns defaults silently.
         let config = load_config_from(&scratch_dir("missing").join("config.toml"));
         assert!(config.shortcuts.new_workspace.is_none());
-        assert!(config.shortcuts.close_workspace.is_none());
+        assert!(config.shortcuts.close_pane.is_none());
     }
 
     #[test]
@@ -459,7 +541,7 @@ buttons_right = ["split_right", "toggle_sidebar"]
     #[test]
     fn test_bad_entry_keeps_other_entries() {
         let config = parse_config(
-            "[shortcuts]\nnew_workspace = 42\nclose_workspace = \"<Ctrl>w\"\n\
+            "[shortcuts]\nnew_workspace = 42\nclose_pane = \"<Ctrl>w\"\n\
              [session]\nrestore = \"yes please\"\n\
              [terminal]\nscrollback_bytes = 1000\n\
              [ui.header_bar]\nstyle = \"none\"\n",
@@ -467,7 +549,7 @@ buttons_right = ["split_right", "toggle_sidebar"]
         );
         // The bad shortcut is dropped, the good one is kept.
         assert!(config.shortcuts.new_workspace.is_none());
-        assert_eq!(config.shortcuts.close_workspace.as_deref(), Some("<Ctrl>w"));
+        assert_eq!(config.shortcuts.close_pane.as_deref(), Some("<Ctrl>w"));
         // The bad session value falls back to its default; the other sections load.
         assert!(config.session.restore);
         assert_eq!(config.terminal.scrollback_bytes, 1000);
@@ -492,18 +574,39 @@ buttons_right = ["split_right", "toggle_sidebar"]
             eprintln!("Skipping test_shortcut_map: GTK4 init failed (headless)");
             return;
         }
-        // Defaults: Ctrl+N should map to NewWorkspace
+        // Defaults: Ctrl+Shift+N maps to NewWorkspace, and plain Ctrl+N is left to the shell.
         let smap = ShortcutMap::from_config(&ShortcutConfig::default());
-        assert_eq!(smap.lookup(ModifierType::CONTROL_MASK, Key::n), Some(ShortcutAction::NewWorkspace));
+        let shift = ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK;
+        assert_eq!(smap.lookup(shift, Key::n), Some(ShortcutAction::NewWorkspace));
+        assert_eq!(smap.lookup(ModifierType::CONTROL_MASK, Key::n), None);
 
-        // Custom: Ctrl+T maps to NewWorkspace and Ctrl+N no longer does
+        // Custom: Ctrl+Shift+Y maps to NewWorkspace and Ctrl+Shift+N no longer does
         let config = ShortcutConfig {
-            new_workspace: Some("<Ctrl>t".to_string()),
+            new_workspace: Some("<Ctrl><Shift>y".to_string()),
             ..Default::default()
         };
         let smap = ShortcutMap::from_config(&config);
-        assert_eq!(smap.lookup(ModifierType::CONTROL_MASK, Key::t), Some(ShortcutAction::NewWorkspace));
-        assert_eq!(smap.lookup(ModifierType::CONTROL_MASK, Key::n), None);
+        assert_eq!(smap.lookup(shift, Key::y), Some(ShortcutAction::NewWorkspace));
+        assert_eq!(smap.lookup(shift, Key::n), None);
+
+        // Plain Ctrl+letter chords (Ctrl+D EOF, Ctrl+W, Ctrl+N, ...) must reach the shell.
+        let defaults = ShortcutMap::from_config(&ShortcutConfig::default());
+        for (mods, key) in defaults.map.keys() {
+            let plain_ctrl = *mods == ModifierType::CONTROL_MASK;
+            let letter = key.to_unicode().is_some_and(|c| c.is_ascii_alphabetic() || c == '[' || c == ']');
+            assert!(!(plain_ctrl && letter), "plain Ctrl+{:?} would swallow a shell chord", key.name());
+        }
+
+        // Alt+Shift+= and Alt+Shift+- are bound under both keysyms a layout can report.
+        let alt_shift = ModifierType::ALT_MASK | ModifierType::SHIFT_MASK;
+        assert_eq!(defaults.lookup(alt_shift, Key::plus), Some(ShortcutAction::SplitRight));
+        assert_eq!(defaults.lookup(alt_shift, Key::equal), Some(ShortcutAction::SplitRight));
+        assert_eq!(defaults.lookup(alt_shift, Key::underscore), Some(ShortcutAction::SplitDown));
+        assert_eq!(defaults.lookup(alt_shift, Key::minus), Some(ShortcutAction::SplitDown));
+        assert_eq!(
+            defaults.lookup(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK, Key::ISO_Left_Tab),
+            Some(ShortcutAction::PrevTab)
+        );
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use super::params::TabRef;
+use crate::split_engine::FocusDirection;
 use serde_json::Value;
 
 pub type RespTx = tokio::sync::oneshot::Sender<Value>;
@@ -5,6 +7,8 @@ pub type RespTx = tokio::sync::oneshot::Sender<Value>;
 /// Commands dispatched from tokio accept loop to GTK main thread.
 /// All variants carry `req_id` (echoed in response) and `resp_tx` (result channel).
 /// GTK/AppState reads and mutations happen ONLY in handlers.rs on the main thread.
+/// Parameters are parsed in mod.rs (see params.rs) before a command is sent.
+// Some surface.* stubs carry an id they do not read yet (split, read_text).
 #[allow(dead_code)]
 pub enum SocketCommand {
     // -- system.* --
@@ -24,6 +28,23 @@ pub enum SocketCommand {
     WorkspacePrev    { req_id: Value, resp_tx: RespTx },
     WorkspaceLast    { req_id: Value, resp_tx: RespTx },
     WorkspaceReorder { req_id: Value, id: String, position: usize, resp_tx: RespTx },
+
+    // -- tab.* (Workspace -> Tabs -> Splits). Indexes are 0-based; no target means the active tab. --
+    TabList          { req_id: Value, workspace: Option<String>, resp_tx: RespTx },
+    TabNew           { req_id: Value, resp_tx: RespTx },
+    TabSelect        { req_id: Value, target: TabRef, resp_tx: RespTx },
+    TabClose         { req_id: Value, target: Option<TabRef>, resp_tx: RespTx },
+    TabNext          { req_id: Value, resp_tx: RespTx },
+    TabPrev          { req_id: Value, resp_tx: RespTx },
+    TabMove          { req_id: Value, from: usize, to: usize, resp_tx: RespTx },
+    TabRename        { req_id: Value, name: String, resp_tx: RespTx },
+
+    // -- layout of the active tab: split.auto, pane.cwd, pane.resize/equalize/zoom --
+    SplitAuto        { req_id: Value, resp_tx: RespTx },
+    PaneCwd          { req_id: Value, id: Option<String>, resp_tx: RespTx },
+    PaneResize       { req_id: Value, direction: FocusDirection, px: i32, resp_tx: RespTx },
+    PaneEqualize     { req_id: Value, resp_tx: RespTx },
+    PaneZoom         { req_id: Value, resp_tx: RespTx },
 
     // -- surface.* (implemented in Plan 04) --
     SurfaceList      { req_id: Value, resp_tx: RespTx },

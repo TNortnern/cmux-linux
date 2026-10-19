@@ -25,6 +25,16 @@ pub fn register_actions(
     });
     window.add_action(&action);
 
+    // win.new-tab (Ctrl+Shift+T)
+    let action = gio::SimpleAction::new("new-tab", None);
+    action.connect_activate({
+        let state = state.clone();
+        move |_, _| {
+            crate::shortcuts::handle_new_tab(&state);
+        }
+    });
+    window.add_action(&action);
+
     // win.new-ssh-workspace
     let action = gio::SimpleAction::new("new-ssh-workspace", None);
     action.connect_activate({
@@ -177,7 +187,47 @@ pub fn register_actions(
     });
     window.add_action(&action);
 
-    // win.rename-workspace
+    // win.split-auto (Alt+Shift+D)
+    let action = gio::SimpleAction::new("split-auto", None);
+    action.connect_activate({
+        let state = state.clone();
+        move |_, _| {
+            crate::shortcuts::handle_split_auto(&state);
+        }
+    });
+    window.add_action(&action);
+
+    // win.zoom-pane (Ctrl+Shift+Z)
+    let action = gio::SimpleAction::new("zoom-pane", None);
+    action.connect_activate({
+        let state = state.clone();
+        move |_, _| {
+            crate::shortcuts::handle_zoom(&state);
+        }
+    });
+    window.add_action(&action);
+
+    // win.equalize (Ctrl+Shift+E)
+    let action = gio::SimpleAction::new("equalize", None);
+    action.connect_activate({
+        let state = state.clone();
+        move |_, _| {
+            crate::shortcuts::handle_equalize(&state);
+        }
+    });
+    window.add_action(&action);
+
+    // win.rename-tab (Ctrl+Shift+R)
+    let action = gio::SimpleAction::new("rename-tab", None);
+    action.connect_activate({
+        let state = state.clone();
+        move |_, _| {
+            state.borrow_mut().begin_active_tab_rename();
+        }
+    });
+    window.add_action(&action);
+
+    // win.rename-workspace (sidebar context menu)
     let action = gio::SimpleAction::new("rename-workspace", None);
     action.connect_activate({
         let state = state.clone();
@@ -218,7 +268,7 @@ pub fn register_actions(
                     .version(env!("CARGO_PKG_VERSION"))
                     .comments("GPU-accelerated terminal multiplexer for Linux")
                     .website("https://github.com/manaflow-ai/cmux")
-                    .license_type(gtk4::License::MitX11)
+                    .license_type(gtk4::License::Agpl30)
                     .transient_for(&win)
                     .modal(true)
                     .build();
@@ -255,20 +305,26 @@ pub fn register_actions(
 
 /// Register keyboard accelerators for GIO actions so menus show shortcut hints.
 /// Per Pitfall 3 from RESEARCH.md: GTK4 shows accels in menus ONLY if registered via set_accels_for_action.
+/// Accelerators match the keymap in shortcuts.rs and the README. The capture-phase handler does the
+/// work; these only show the hints in menus. Plain Ctrl+letter chords are left to the shell.
 pub fn register_accels(app: &gtk4::Application) {
-    app.set_accels_for_action("win.new-workspace", &["<Ctrl>n"]);
-    app.set_accels_for_action("win.close-workspace", &["<Ctrl><Shift>w"]);
+    app.set_accels_for_action("win.new-tab", &["<Ctrl><Shift>t"]);
+    app.set_accels_for_action("win.close-pane", &["<Ctrl><Shift>w"]);
+    app.set_accels_for_action("win.new-workspace", &["<Ctrl><Shift>n"]);
     app.set_accels_for_action("win.new-ssh-workspace", &["<Ctrl><Shift>s"]);
-    app.set_accels_for_action("win.browser-open", &["<Ctrl><Shift>b"]);
-    app.set_accels_for_action("win.close-pane", &["<Ctrl><Shift>x"]);
-    app.set_accels_for_action("win.toggle-sidebar", &["<Ctrl>b"]);
-    app.set_accels_for_action("win.split-right", &["<Ctrl>d"]);
-    app.set_accels_for_action("win.split-down", &["<Ctrl><Shift>d"]);
+    app.set_accels_for_action("win.browser-open", &["<Ctrl><Alt>b"]);
+    app.set_accels_for_action("win.toggle-sidebar", &["<Ctrl><Shift>b"]);
+    app.set_accels_for_action("win.split-right", &["<Alt><Shift>plus"]);
+    app.set_accels_for_action("win.split-down", &["<Alt><Shift>underscore"]);
+    app.set_accels_for_action("win.split-auto", &["<Alt><Shift>d"]);
+    app.set_accels_for_action("win.zoom-pane", &["<Ctrl><Shift>z"]);
+    app.set_accels_for_action("win.equalize", &["<Ctrl><Shift>e"]);
     app.set_accels_for_action("win.copy", &["<Ctrl><Shift>c"]);
     app.set_accels_for_action("win.paste", &["<Ctrl><Shift>v"]);
-    app.set_accels_for_action("win.find", &["<Ctrl>f"]);
-    app.set_accels_for_action("win.rename-workspace", &["<Ctrl><Shift>r"]);
-    app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
+    app.set_accels_for_action("win.find", &["<Ctrl><Shift>f"]);
+    app.set_accels_for_action("win.rename-tab", &["<Ctrl><Shift>r"]);
+    app.set_accels_for_action("win.preferences", &["<Ctrl>comma"]);
+    app.set_accels_for_action("app.quit", &["<Ctrl><Shift>q"]);
 }
 
 /// Build the hamburger menu model (D-11, D-12).
@@ -279,6 +335,7 @@ pub fn build_hamburger_menu() -> gio::Menu {
 
     // File section (D-12)
     let file_section = gio::Menu::new();
+    file_section.append(Some("New Tab"), Some("win.new-tab"));
     file_section.append(Some("New Workspace"), Some("win.new-workspace"));
     file_section.append(Some("New SSH Workspace"), Some("win.new-ssh-workspace"));
     file_section.append(Some("New Browser"), Some("win.browser-open"));
@@ -298,8 +355,12 @@ pub fn build_hamburger_menu() -> gio::Menu {
     // View section (D-12)
     let view_section = gio::Menu::new();
     view_section.append(Some("Toggle Sidebar"), Some("win.toggle-sidebar"));
+    view_section.append(Some("Rename Tab"), Some("win.rename-tab"));
     view_section.append(Some("Split Right"), Some("win.split-right"));
     view_section.append(Some("Split Down"), Some("win.split-down"));
+    view_section.append(Some("Split Along Longer Side"), Some("win.split-auto"));
+    view_section.append(Some("Zoom Pane"), Some("win.zoom-pane"));
+    view_section.append(Some("Equalize Panes"), Some("win.equalize"));
     menu.append_section(Some("View"), &view_section);
 
     // Help section (D-12)
@@ -352,91 +413,69 @@ pub fn build_browser_context_menu() -> gio::Menu {
     menu
 }
 
+/// Keyboard shortcuts shown in the help window. Mirrors the defaults in config.rs (ShortcutConfig).
+const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    ("Tabs", &[
+        ("<Ctrl><Shift>t", "New Tab"),
+        ("<Ctrl><Shift>w", "Close Pane (closes the tab on its last pane)"),
+        ("<Ctrl>Tab", "Next Tab"),
+        ("<Ctrl><Shift>Tab", "Previous Tab"),
+        ("<Ctrl>1..8", "Select Tab 1-8"),
+        ("<Ctrl>9", "Last Tab"),
+        ("<Ctrl><Shift>r", "Rename Tab"),
+    ]),
+    ("Panes", &[
+        ("<Alt><Shift>plus", "Split Right"),
+        ("<Alt><Shift>underscore", "Split Down"),
+        ("<Alt><Shift>d", "Split Along Longer Side"),
+        ("<Alt>Left", "Focus Left"),
+        ("<Alt>Right", "Focus Right"),
+        ("<Alt>Up", "Focus Up"),
+        ("<Alt>Down", "Focus Down"),
+        ("<Alt><Shift>Left", "Resize Left"),
+        ("<Alt><Shift>Right", "Resize Right"),
+        ("<Alt><Shift>Up", "Resize Up"),
+        ("<Alt><Shift>Down", "Resize Down"),
+        ("<Ctrl><Shift>z", "Zoom Pane"),
+        ("<Ctrl><Shift>e", "Equalize Panes"),
+    ]),
+    ("Workspaces", &[
+        ("<Ctrl><Shift>n", "New Workspace"),
+        ("<Ctrl><Alt>1..9", "Select Workspace 1-9"),
+        ("<Ctrl><Shift>s", "New SSH Workspace"),
+    ]),
+    ("View", &[
+        ("<Ctrl><Shift>b", "Toggle Sidebar"),
+        ("<Ctrl><Alt>b", "Open Browser"),
+        ("<Ctrl><Alt><Shift>b", "Close Browser"),
+    ]),
+    ("Edit", &[
+        ("<Ctrl><Shift>c", "Copy"),
+        ("<Ctrl><Shift>v", "Paste"),
+        ("<Ctrl><Shift>f", "Find"),
+    ]),
+    ("General", &[
+        ("<Ctrl>comma", "Preferences"),
+        ("<Ctrl><Shift>q", "Quit"),
+    ]),
+];
+
 /// Build GtkShortcutsWindow (D-14) with all shortcuts grouped by category.
 /// Uses GTK 4.14 add_section/add_group API.
 fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
     let window = gtk4::ShortcutsWindow::builder().build();
-
-    // Workspaces section
-    let ws_section = gtk4::ShortcutsSection::builder()
-        .section_name("workspaces")
-        .title("Workspaces")
-        .build();
-
-    let ws_group = gtk4::ShortcutsGroup::builder()
-        .title("Workspaces")
-        .build();
-    ws_group.add_shortcut(&shortcut("<Ctrl>n", "New Workspace"));
-    ws_group.add_shortcut(&shortcut("<Ctrl><Shift>w", "Close Workspace"));
-    ws_group.add_shortcut(&shortcut("<Ctrl>bracketright", "Next Workspace"));
-    ws_group.add_shortcut(&shortcut("<Ctrl>bracketleft", "Previous Workspace"));
-    ws_group.add_shortcut(&shortcut("<Ctrl><Shift>r", "Rename Workspace"));
-    ws_group.add_shortcut(&shortcut("<Ctrl>1..9", "Switch to Workspace 1-9"));
-    ws_section.add_group(&ws_group);
-    window.add_section(&ws_section);
-
-    // Panes section
-    let pane_section = gtk4::ShortcutsSection::builder()
-        .section_name("panes")
-        .title("Panes")
-        .build();
-
-    let pane_group = gtk4::ShortcutsGroup::builder()
-        .title("Panes")
-        .build();
-    pane_group.add_shortcut(&shortcut("<Ctrl>d", "Split Right"));
-    pane_group.add_shortcut(&shortcut("<Ctrl><Shift>d", "Split Down"));
-    pane_group.add_shortcut(&shortcut("<Ctrl><Shift>x", "Close Pane"));
-    pane_group.add_shortcut(&shortcut("<Ctrl><Shift>Left", "Focus Left"));
-    pane_group.add_shortcut(&shortcut("<Ctrl><Shift>Right", "Focus Right"));
-    pane_group.add_shortcut(&shortcut("<Ctrl><Shift>Up", "Focus Up"));
-    pane_group.add_shortcut(&shortcut("<Ctrl><Shift>Down", "Focus Down"));
-    pane_section.add_group(&pane_group);
-    window.add_section(&pane_section);
-
-    // Edit section
-    let edit_section = gtk4::ShortcutsSection::builder()
-        .section_name("edit")
-        .title("Edit")
-        .build();
-
-    let edit_group = gtk4::ShortcutsGroup::builder()
-        .title("Edit")
-        .build();
-    edit_group.add_shortcut(&shortcut("<Ctrl><Shift>c", "Copy"));
-    edit_group.add_shortcut(&shortcut("<Ctrl><Shift>v", "Paste"));
-    edit_group.add_shortcut(&shortcut("<Ctrl>f", "Find"));
-    edit_section.add_group(&edit_group);
-    window.add_section(&edit_section);
-
-    // View section
-    let view_section = gtk4::ShortcutsSection::builder()
-        .section_name("view")
-        .title("View")
-        .build();
-
-    let view_group = gtk4::ShortcutsGroup::builder()
-        .title("View")
-        .build();
-    view_group.add_shortcut(&shortcut("<Ctrl>b", "Toggle Sidebar"));
-    view_group.add_shortcut(&shortcut("<Ctrl><Shift>b", "Open Browser"));
-    view_group.add_shortcut(&shortcut("<Ctrl><Shift>s", "New SSH Workspace"));
-    view_section.add_group(&view_group);
-    window.add_section(&view_section);
-
-    // General section
-    let general_section = gtk4::ShortcutsSection::builder()
-        .section_name("general")
-        .title("General")
-        .build();
-
-    let general_group = gtk4::ShortcutsGroup::builder()
-        .title("General")
-        .build();
-    general_group.add_shortcut(&shortcut("<Ctrl>q", "Quit"));
-    general_section.add_group(&general_group);
-    window.add_section(&general_section);
-
+    for (title, shortcuts) in SHORTCUT_GROUPS {
+        let section = gtk4::ShortcutsSection::builder()
+            .section_name(title.to_lowercase())
+            .title(*title)
+            .build();
+        let group = gtk4::ShortcutsGroup::builder().title(*title).build();
+        for (accel, label) in shortcuts.iter() {
+            group.add_shortcut(&shortcut(accel, label));
+        }
+        section.add_group(&group);
+        window.add_section(&section);
+    }
     window
 }
 

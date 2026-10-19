@@ -5,13 +5,17 @@ use gtk4::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// Pixels one resize shortcut moves a divider by.
+pub const RESIZE_STEP_PX: i32 = 40;
+
 /// Install all cmux keyboard shortcuts on the application window.
 ///
 /// Uses PropagationPhase::Capture (parent -> child) so the window controller fires
 /// BEFORE Ghostty's per-GLArea EventControllerKey. Without capture phase, Ghostty
 /// eats Ctrl+D, Ctrl+N, etc. (per RESEARCH.md Pattern 4 and Anti-patterns).
 ///
-/// Shortcut bindings are driven by ShortcutMap (config-driven, D-06).
+/// Shortcut bindings are driven by ShortcutMap (config-driven, D-06). Keys with no
+/// binding, and Ctrl+Alt+digit presses that are AltGr characters, proceed to the terminal.
 pub fn install_shortcuts(
     window: &gtk4::ApplicationWindow,
     state: Rc<RefCell<AppState>>,
@@ -25,120 +29,154 @@ pub fn install_shortcuts(
 
     let sidebar_clone = sidebar.clone();
     let app_clone = app.clone();
+    let window_clone = window.clone();
+    let display = gtk4::prelude::WidgetExt::display(window);
 
     key_ctrl.connect_key_pressed({
         let state = state.clone();
-        move |_ctrl, keyval, _keycode, mods| {
-            match shortcut_map.lookup(mods, keyval) {
-                // -- Workspace shortcuts --
-                Some(ShortcutAction::NewWorkspace) => {
-                    handle_new_workspace(&state, &app_clone);
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::CloseWorkspace) => {
-                    handle_close_workspace(&state, &app_clone);
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::NextWorkspace) => {
-                    state.borrow_mut().switch_next();
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::PrevWorkspace) => {
-                    state.borrow_mut().switch_prev();
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::RenameWorkspace) => {
-                    let (active_index, sidebar_list) = {
-                        let s = state.borrow();
-                        let idx = s.active_index;
-                        let list = s.sidebar_list.clone();
-                        (idx, list)
-                    };
-                    crate::sidebar::start_inline_rename(&sidebar_list, active_index, state.clone());
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::ToggleSidebar) => {
+        move |_ctrl, keyval, keycode, mods| {
+            let Some(action) = shortcut_map.lookup(mods, keyval) else {
+                return gtk4::glib::Propagation::Proceed;
+            };
+            if is_workspace_digit(action) && !altgr_allows_digit(&display, keycode, keyval) {
+                return gtk4::glib::Propagation::Proceed;
+            }
+            match action {
+                // -- Tabs --
+                ShortcutAction::NewTab => handle_new_tab(&state),
+                ShortcutAction::ClosePane => handle_close_pane(&state, &app_clone),
+                ShortcutAction::NextTab => state.borrow_mut().next_tab(),
+                ShortcutAction::PrevTab => state.borrow_mut().prev_tab(),
+                ShortcutAction::LastTab => state.borrow_mut().select_last_tab(),
+                ShortcutAction::Tab1 => state.borrow_mut().select_tab(0),
+                ShortcutAction::Tab2 => state.borrow_mut().select_tab(1),
+                ShortcutAction::Tab3 => state.borrow_mut().select_tab(2),
+                ShortcutAction::Tab4 => state.borrow_mut().select_tab(3),
+                ShortcutAction::Tab5 => state.borrow_mut().select_tab(4),
+                ShortcutAction::Tab6 => state.borrow_mut().select_tab(5),
+                ShortcutAction::Tab7 => state.borrow_mut().select_tab(6),
+                ShortcutAction::Tab8 => state.borrow_mut().select_tab(7),
+                ShortcutAction::RenameTab => state.borrow_mut().begin_active_tab_rename(),
+                // -- Pane splits, focus, resize, zoom --
+                ShortcutAction::SplitRight => handle_split(&state, false),
+                ShortcutAction::SplitDown => handle_split(&state, true),
+                ShortcutAction::SplitAuto => handle_split_auto(&state),
+                ShortcutAction::FocusLeft => handle_focus_direction(&state, FocusDirection::Left),
+                ShortcutAction::FocusRight => handle_focus_direction(&state, FocusDirection::Right),
+                ShortcutAction::FocusUp => handle_focus_direction(&state, FocusDirection::Up),
+                ShortcutAction::FocusDown => handle_focus_direction(&state, FocusDirection::Down),
+                ShortcutAction::ResizeLeft => handle_resize(&state, FocusDirection::Left),
+                ShortcutAction::ResizeRight => handle_resize(&state, FocusDirection::Right),
+                ShortcutAction::ResizeUp => handle_resize(&state, FocusDirection::Up),
+                ShortcutAction::ResizeDown => handle_resize(&state, FocusDirection::Down),
+                ShortcutAction::ZoomPane => handle_zoom(&state),
+                ShortcutAction::Equalize => handle_equalize(&state),
+                // -- Workspaces --
+                ShortcutAction::NewWorkspace => handle_new_workspace(&state, &app_clone),
+                ShortcutAction::Workspace1 => state.borrow_mut().switch_to_index(0),
+                ShortcutAction::Workspace2 => state.borrow_mut().switch_to_index(1),
+                ShortcutAction::Workspace3 => state.borrow_mut().switch_to_index(2),
+                ShortcutAction::Workspace4 => state.borrow_mut().switch_to_index(3),
+                ShortcutAction::Workspace5 => state.borrow_mut().switch_to_index(4),
+                ShortcutAction::Workspace6 => state.borrow_mut().switch_to_index(5),
+                ShortcutAction::Workspace7 => state.borrow_mut().switch_to_index(6),
+                ShortcutAction::Workspace8 => state.borrow_mut().switch_to_index(7),
+                ShortcutAction::Workspace9 => state.borrow_mut().switch_to_index(8),
+                // -- View, app and browser --
+                ShortcutAction::ToggleSidebar => {
                     let visible = sidebar_clone.is_visible();
                     sidebar_clone.set_visible(!visible);
                     if let Some(engine) = state.borrow_mut().active_split_engine_mut() {
                         engine.focus_active_surface();
                     }
-                    gtk4::glib::Propagation::Stop
                 }
-                // -- Pane split shortcuts --
-                Some(ShortcutAction::SplitRight) => {
-                    handle_split(&state, false);
-                    gtk4::glib::Propagation::Stop
+                // Find is still a stub (its win.find action is disabled), so the key reaches the terminal.
+                ShortcutAction::Find => return gtk4::glib::Propagation::Proceed,
+                ShortcutAction::NewSshWorkspace => handle_new_ssh_workspace(&state, &app_clone),
+                ShortcutAction::Preferences => {
+                    let _ = gtk4::prelude::WidgetExt::activate_action(&window_clone, "win.preferences", None);
                 }
-                Some(ShortcutAction::SplitDown) => {
-                    handle_split(&state, true);
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::ClosePane) => {
-                    handle_close_pane(&state, &app_clone);
-                    gtk4::glib::Propagation::Stop
-                }
-                // -- SSH workspace shortcut --
-                Some(ShortcutAction::NewSshWorkspace) => {
-                    handle_new_ssh_workspace(&state, &app_clone);
-                    gtk4::glib::Propagation::Stop
-                }
-                // -- Focus direction shortcuts --
-                Some(ShortcutAction::FocusLeft) => {
-                    handle_focus_direction(&state, FocusDirection::Left);
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::FocusRight) => {
-                    handle_focus_direction(&state, FocusDirection::Right);
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::FocusUp) => {
-                    handle_focus_direction(&state, FocusDirection::Up);
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::FocusDown) => {
-                    handle_focus_direction(&state, FocusDirection::Down);
-                    gtk4::glib::Propagation::Stop
-                }
-                // -- Workspace number shortcuts --
-                Some(action @ (
-                    ShortcutAction::Workspace1 | ShortcutAction::Workspace2 |
-                    ShortcutAction::Workspace3 | ShortcutAction::Workspace4 |
-                    ShortcutAction::Workspace5 | ShortcutAction::Workspace6 |
-                    ShortcutAction::Workspace7 | ShortcutAction::Workspace8 |
-                    ShortcutAction::Workspace9
-                )) => {
-                    let idx = match action {
-                        ShortcutAction::Workspace1 => 0,
-                        ShortcutAction::Workspace2 => 1,
-                        ShortcutAction::Workspace3 => 2,
-                        ShortcutAction::Workspace4 => 3,
-                        ShortcutAction::Workspace5 => 4,
-                        ShortcutAction::Workspace6 => 5,
-                        ShortcutAction::Workspace7 => 6,
-                        ShortcutAction::Workspace8 => 7,
-                        ShortcutAction::Workspace9 => 8,
-                        _ => unreachable!(),
-                    };
-                    state.borrow_mut().switch_to_index(idx);
-                    gtk4::glib::Propagation::Stop
-                }
-                // -- Browser shortcuts --
-                Some(ShortcutAction::BrowserOpen) => {
-                    handle_browser_open(&state);
-                    gtk4::glib::Propagation::Stop
-                }
-                Some(ShortcutAction::BrowserClose) => {
-                    handle_browser_close(&state);
-                    gtk4::glib::Propagation::Stop
-                }
-                // Everything else passes through to Ghostty.
-                _ => gtk4::glib::Propagation::Proceed,
+                ShortcutAction::Quit => app_clone.quit(),
+                ShortcutAction::BrowserOpen => handle_browser_open(&state),
+                ShortcutAction::BrowserClose => handle_browser_close(&state),
             }
+            gtk4::glib::Propagation::Stop
         }
     });
 
     window.add_controller(key_ctrl);
+}
+
+fn is_workspace_digit(action: ShortcutAction) -> bool {
+    matches!(
+        action,
+        ShortcutAction::Workspace1
+            | ShortcutAction::Workspace2
+            | ShortcutAction::Workspace3
+            | ShortcutAction::Workspace4
+            | ShortcutAction::Workspace5
+            | ShortcutAction::Workspace6
+            | ShortcutAction::Workspace7
+            | ShortcutAction::Workspace8
+            | ShortcutAction::Workspace9
+    )
+}
+
+/// Whether a Ctrl+Alt+<digit> press is a workspace shortcut and not an AltGr character.
+/// On European layouts AltGr arrives as Ctrl+Alt, and AltGr+2 may type a character such as
+/// a superscript two, so that character must reach the terminal.
+///
+/// `base_is_digit`: the key's keyval without the AltGr level is a digit.
+/// `typed`: the printable character the event's keyval produces, if any.
+pub fn ctrl_alt_digit_is_shortcut(base_is_digit: bool, typed: Option<char>) -> bool {
+    base_is_digit && typed.map_or(true, |c| c.is_ascii_digit())
+}
+
+/// Reads the keyboard map for `keycode` and applies `ctrl_alt_digit_is_shortcut`.
+fn altgr_allows_digit(display: &gtk4::gdk::Display, keycode: u32, keyval: gtk4::gdk::Key) -> bool {
+    let base_is_digit = display.map_keycode(keycode).is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|(key, val)| key.level() == 0 && val.to_unicode().is_some_and(|c| c.is_ascii_digit()))
+    });
+    ctrl_alt_digit_is_shortcut(base_is_digit, keyval.to_unicode())
+}
+
+/// Open a new tab in the focused pane's folder (Ctrl+Shift+T).
+pub fn handle_new_tab(state: &Rc<RefCell<AppState>>) {
+    state.borrow_mut().new_tab();
+}
+
+/// Split the active pane along its longer side.
+pub fn handle_split_auto(state: &Rc<RefCell<AppState>>) {
+    let mut s = state.borrow_mut();
+    if let Some(engine) = s.active_split_engine_mut() {
+        engine.split_auto();
+    }
+}
+
+/// Move the divider on the `direction` side of the active pane by RESIZE_STEP_PX.
+pub fn handle_resize(state: &Rc<RefCell<AppState>>, direction: FocusDirection) {
+    let mut s = state.borrow_mut();
+    if let Some(engine) = s.active_split_engine_mut() {
+        engine.resize_active(direction, RESIZE_STEP_PX);
+    }
+}
+
+/// Toggle zoom on the active pane (Ctrl+Shift+Z).
+pub fn handle_zoom(state: &Rc<RefCell<AppState>>) {
+    let mut s = state.borrow_mut();
+    if let Some(engine) = s.active_split_engine_mut() {
+        engine.toggle_zoom();
+    }
+}
+
+/// Make every pane of the active tab the same size (Ctrl+Shift+E).
+pub fn handle_equalize(state: &Rc<RefCell<AppState>>) {
+    let mut s = state.borrow_mut();
+    if let Some(engine) = s.active_split_engine_mut() {
+        engine.equalize();
+    }
 }
 
 /// Create a new workspace with an initial GLArea pane and add it to AppState + GtkStack.
@@ -182,7 +220,7 @@ pub fn handle_close_workspace(state: &Rc<RefCell<AppState>>, app: &gtk4::Applica
     });
 }
 
-/// Split the active pane. `vertical=false` -> split right (Ctrl+D), `vertical=true` -> split down.
+/// Split the active pane. `vertical=false` -> split right (Alt+Shift+=), `vertical=true` -> split down (Alt+Shift+-).
 pub fn handle_split(state: &Rc<RefCell<AppState>>, vertical: bool) {
     let mut s = state.borrow_mut();
     if let Some(engine) = s.active_split_engine_mut() {
@@ -196,7 +234,7 @@ pub fn handle_split(state: &Rc<RefCell<AppState>>, vertical: bool) {
     }
 }
 
-/// Close the active pane (Ctrl+Shift+X). The last pane of a tab closes the tab; AppState handles that.
+/// Close the active pane (Ctrl+Shift+W). The last pane of a tab closes the tab; AppState handles that.
 pub fn handle_close_pane(state: &Rc<RefCell<AppState>>, _app: &gtk4::Application) {
     let active_pane = state.borrow().active_split_engine().map(|e| e.active_pane_id);
     if let Some(pane_id) = active_pane {
@@ -217,7 +255,7 @@ pub fn handle_focus_direction(state: &Rc<RefCell<AppState>>, direction: FocusDir
     }
 }
 
-/// Open a browser preview pane (Ctrl+Shift+B).
+/// Open a browser preview pane (Ctrl+Alt+B).
 /// Launches the agent-browser daemon, navigates to about:blank, creates a preview pane,
 /// and starts the CDP screencast stream so frames render in the Picture widget.
 pub fn handle_browser_open(state: &Rc<RefCell<AppState>>) {
@@ -592,6 +630,35 @@ pub fn handle_browser_open(state: &Rc<RefCell<AppState>>) {
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::ctrl_alt_digit_is_shortcut;
+
+    #[test]
+    fn ctrl_alt_digit_without_altgr_is_a_shortcut() {
+        // US layout: Ctrl+Alt+1 has base digit 1 and produces '1'.
+        assert!(ctrl_alt_digit_is_shortcut(true, Some('1')));
+        // Keyval with no printable character at all.
+        assert!(ctrl_alt_digit_is_shortcut(true, None));
+    }
+
+    #[test]
+    fn altgr_character_is_not_a_shortcut() {
+        // German layout: AltGr+2 produces superscript two, base key is still a digit.
+        assert!(!ctrl_alt_digit_is_shortcut(true, Some('\u{00B2}')));
+        // AltGr+digit producing a brace or a letter on other layouts.
+        assert!(!ctrl_alt_digit_is_shortcut(true, Some('{')));
+        assert!(!ctrl_alt_digit_is_shortcut(true, Some('@')));
+    }
+
+    #[test]
+    fn non_digit_base_key_is_never_a_digit_shortcut() {
+        // AZERTY: unshifted 1 key has base '&', so Ctrl+Alt+1 never matches a workspace.
+        assert!(!ctrl_alt_digit_is_shortcut(false, Some('&')));
+        assert!(!ctrl_alt_digit_is_shortcut(false, None));
+    }
+}
+
 /// Map GDK keyval to (CDP key name, CDP code name).
 /// Returns empty strings for unmapped keys.
 fn gdk_keyval_to_cdp(keyval: gtk4::gdk::Key) -> (String, String) {
@@ -652,7 +719,7 @@ fn cdp_modifiers(mods: gtk4::gdk::ModifierType) -> i32 {
     m
 }
 
-/// Close the browser preview and shut down the daemon (Ctrl+Shift+Q).
+/// Close the browser preview and shut down the daemon (Ctrl+Alt+Shift+B).
 pub fn handle_browser_close(state: &Rc<RefCell<AppState>>) {
     let mut s = state.borrow_mut();
     if let Some(ref mut bm) = s.browser_manager {

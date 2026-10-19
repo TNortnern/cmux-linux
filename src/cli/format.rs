@@ -290,6 +290,8 @@ pub fn format_response(method: &str, result: &Value, json_mode: bool, color: boo
             format!("{} ({})", title, id)
         }
         "surface.list" => format_surface_list(result, color),
+        "tab.list" => format_tab_list(result),
+        "pane.cwd" => result.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         "pane.list" => format_pane_list(result, color),
         "window.list" => format_window_list(result, color),
         "window.current" => {
@@ -331,6 +333,24 @@ pub fn format_response(method: &str, result: &Value, json_mode: bool, color: boo
 }
 
 /// Format a browser surface list response.
+/// One line per tab: `* 0  Tab 1  (2 panes)`, where `*` marks the selected tab.
+pub fn format_tab_list(result: &Value) -> String {
+    let Some(tabs) = result.get("tabs").and_then(|v| v.as_array()) else {
+        return format_fallback(result);
+    };
+    tabs.iter()
+        .map(|tab| {
+            let mark = if tab.get("selected").and_then(|v| v.as_bool()) == Some(true) { "*" } else { " " };
+            let index = tab.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+            let name = tab.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let panes = tab.get("panes").and_then(|v| v.as_u64()).unwrap_or(0);
+            let plural = if panes == 1 { "" } else { "s" };
+            format!("{mark} {index}  {name}  ({panes} pane{plural})")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn format_browser_list(result: &Value, _color: bool) -> String {
     let surfaces = match result.get("surfaces").and_then(|v| v.as_array()) {
         Some(arr) => arr,

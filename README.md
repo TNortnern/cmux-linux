@@ -47,7 +47,30 @@ Packages install `cmux-app` (the GUI), `cmux` (the CLI), a desktop entry, shell 
 
 ## Keyboard shortcuts
 
-<!-- KEYMAP -->
+The keymap follows Windows Terminal. Plain Ctrl+letter chords (Ctrl+D, Ctrl+W, Ctrl+C, Ctrl+B, ...) always go to the shell. Shortcuts can be rebound in `[shortcuts]` in `~/.config/cmux/config.toml`.
+
+| Action | Shortcut |
+|---|---|
+| New tab (in the focused pane's folder) | `Ctrl+Shift+T` |
+| Close pane (closes the tab when it is the last pane) | `Ctrl+Shift+W` |
+| Next tab / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Select tab 1 to 8 / last tab | `Ctrl+1` to `Ctrl+8` / `Ctrl+9` |
+| Rename tab | `Ctrl+Shift+R` |
+| Split right / split down | `Alt+Shift+=` / `Alt+Shift+-` |
+| Split along the longer side | `Alt+Shift+D` |
+| Focus pane left / right / up / down | `Alt+Left` / `Alt+Right` / `Alt+Up` / `Alt+Down` |
+| Resize pane (40 px) | `Alt+Shift+Arrows` |
+| Zoom pane | `Ctrl+Shift+Z` |
+| Equalize panes | `Ctrl+Shift+E` |
+| New workspace | `Ctrl+Shift+N` |
+| Select workspace 1 to 9 | `Ctrl+Alt+1` to `Ctrl+Alt+9` |
+| Toggle sidebar | `Ctrl+Shift+B` |
+| New SSH workspace | `Ctrl+Shift+S` |
+| Open / close browser pane | `Ctrl+Alt+B` / `Ctrl+Alt+Shift+B` |
+| Find (not implemented yet) | `Ctrl+Shift+F` |
+| Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
+| Preferences | `Ctrl+,` |
+| Quit | `Ctrl+Shift+Q` |
 
 ## Socket and security
 

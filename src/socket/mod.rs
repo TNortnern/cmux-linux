@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod commands;
 pub mod handlers;
+pub mod params;
 pub mod validate;
 
 use std::os::unix::fs::PermissionsExt;
@@ -195,6 +196,16 @@ async fn handle_connection(
     }
 }
 
+/// Error response for parameters that fail to parse. Built here, so the GTK thread never sees the request.
+fn invalid_params(req_id: &serde_json::Value, message: &str) -> String {
+    serde_json::json!({
+        "id": req_id,
+        "ok": false,
+        "error": {"code": "invalid_params", "message": message}
+    })
+    .to_string()
+}
+
 /// Parse a JSON-RPC line and dispatch to the appropriate SocketCommand.
 /// Returns the JSON response string (without trailing newline).
 async fn dispatch_line(
@@ -219,6 +230,43 @@ async fn dispatch_line(
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
 
     let cmd = match method.as_str() {
+        "tab.list" => match params::workspace_uuid(&params) {
+            Ok(workspace) => commands::SocketCommand::TabList { req_id: req_id.clone(), workspace, resp_tx },
+            Err(e) => return invalid_params(&req_id, &e),
+        },
+        "tab.new" => commands::SocketCommand::TabNew { req_id: req_id.clone(), resp_tx },
+        "tab.select" => match params::tab_ref(&params) {
+            Ok(Some(target)) => commands::SocketCommand::TabSelect { req_id: req_id.clone(), target, resp_tx },
+            Ok(None) => return invalid_params(&req_id, "tab.select needs index or id"),
+            Err(e) => return invalid_params(&req_id, &e),
+        },
+        "tab.close" => match params::tab_ref(&params) {
+            Ok(target) => commands::SocketCommand::TabClose { req_id: req_id.clone(), target, resp_tx },
+            Err(e) => return invalid_params(&req_id, &e),
+        },
+        "tab.next" => commands::SocketCommand::TabNext { req_id: req_id.clone(), resp_tx },
+        "tab.prev" => commands::SocketCommand::TabPrev { req_id: req_id.clone(), resp_tx },
+        "tab.move" => match params::tab_move(&params) {
+            Ok((from, to)) => commands::SocketCommand::TabMove { req_id: req_id.clone(), from, to, resp_tx },
+            Err(e) => return invalid_params(&req_id, &e),
+        },
+        "tab.rename" => match params::tab_name(&params) {
+            Ok(name) => commands::SocketCommand::TabRename { req_id: req_id.clone(), name, resp_tx },
+            Err(e) => return invalid_params(&req_id, &e),
+        },
+
+        "split.auto" => commands::SocketCommand::SplitAuto { req_id: req_id.clone(), resp_tx },
+        "pane.cwd" => match params::pane_uuid(&params) {
+            Ok(id) => commands::SocketCommand::PaneCwd { req_id: req_id.clone(), id, resp_tx },
+            Err(e) => return invalid_params(&req_id, &e),
+        },
+        "pane.resize" => match params::resize(&params) {
+            Ok((direction, px)) => commands::SocketCommand::PaneResize { req_id: req_id.clone(), direction, px, resp_tx },
+            Err(e) => return invalid_params(&req_id, &e),
+        },
+        "pane.equalize" => commands::SocketCommand::PaneEqualize { req_id: req_id.clone(), resp_tx },
+        "pane.zoom" => commands::SocketCommand::PaneZoom { req_id: req_id.clone(), resp_tx },
+
         "system.ping" => commands::SocketCommand::Ping { req_id: req_id.clone(), resp_tx },
         "system.identify" => commands::SocketCommand::Identify { req_id: req_id.clone(), resp_tx },
         "system.capabilities" => commands::SocketCommand::Capabilities { req_id: req_id.clone(), resp_tx },
