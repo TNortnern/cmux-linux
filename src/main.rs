@@ -14,6 +14,7 @@ mod workspace;
 mod split_engine;
 mod app_state;
 mod sidebar;
+mod tab_bar;
 mod shortcuts;
 mod socket;
 mod session;
@@ -125,6 +126,17 @@ popover.menu { background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radi
 popover.menu modelbutton { padding: 8px 16px; color: #cccccc; font-size: 14px; }
 popover.menu modelbutton:hover { background-color: #3a3a3a; }
 popover.menu accelerator { color: #5b8dd9; font-size: 12px; }
+/* Tab bar above each workspace's splits */
+.tab-bar { background-color: #1f1f1f; border-bottom: 1px solid #3a3a3a; }
+.tab-strip { background-color: transparent; }
+.tab { min-height: 28px; padding: 2px 4px 2px 12px; color: #999999; font-size: 13px; border-bottom: 2px solid transparent; }
+.tab:hover { background-color: #2a2a2a; }
+.tab.tab-active { background-color: #2e2e2e; color: #ffffff; border-bottom-color: #5b8dd9; }
+.tab-close { min-width: 18px; min-height: 18px; padding: 0; margin: 0; background-color: transparent; color: #888888; border: none; }
+.tab-close:hover { color: #cccccc; }
+.tab-add { min-width: 28px; min-height: 28px; padding: 0; margin: 0 4px; background-color: transparent; color: #cccccc; border: none; }
+.tab-add:hover { background-color: #2e2e2e; }
+.tab-rename { font-size: 13px; padding: 0 4px; }
 ";
 
 fn main() {
@@ -370,50 +382,15 @@ fn build_ui(
     }
     MAIN_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 
-    // Restore session if available (SESS-02), otherwise create default workspace.
+    // Restore the saved workspaces, tabs and splits (SESS-02). Tabs stay lazy: a shell starts
+    // only when its tab is first shown. With no saved session, create the first workspace.
     {
-        let has_session = saved_session.as_ref().map(|s| !s.workspaces.is_empty()).unwrap_or(false);
-        if has_session {
-            let session = saved_session.unwrap();
-            if session.version >= 2 {
-                // Version 2: full tree restore (D-05)
-                let mut restored_count = 0;
-                for ws_session in &session.workspaces {
-                    if state.borrow_mut().restore_workspace(ws_session).is_some() {
-                        restored_count += 1;
-                    } else {
-                        // D-15: tree invalid or too deep, fall back to single pane
-                        cmux_warn!("workspace '{}' tree invalid, creating default", ws_session.name);
-                        state.borrow_mut().create_workspace();
-                        state.borrow_mut().rename_active(ws_session.name.clone());
-                    }
-                }
-                cmux_debug!("restored {} workspaces from v2 session", restored_count);
-            } else {
-                // Version 1: name-only restore (auto-upgrade on next save per D-01)
-                for ws_session in &session.workspaces {
-                    state.borrow_mut().create_workspace();
-                    state.borrow_mut().rename_active(ws_session.name.clone());
-                }
-            }
-            // Restore active workspace index.
-            let ws_count = state.borrow().workspaces.len();
-            let active = session.active_index.min(ws_count.saturating_sub(1));
-            state.borrow_mut().switch_to_index(active);
-
-            // D-10: After GLAreas realize, sync surface pointers from registry.
-            if session.version >= 2 {
-                let state_for_sync = state.clone();
-                gtk4::glib::idle_add_local_once(move || {
-                    let mut s = state_for_sync.borrow_mut();
-                    for engine in &mut s.split_engines {
-                        engine.sync_surfaces_from_registry();
-                    }
-                    cmux_debug!("synced surface pointers from registry after restore");
-                });
-            }
-        } else {
-            // No session -- create the default first workspace.
+        let restored = match saved_session {
+            Some(session) => state.borrow_mut().restore_session(&session),
+            None => 0,
+        };
+        cmux_debug!("restored {} workspace(s) from session", restored);
+        if restored == 0 {
             state.borrow_mut().create_workspace();
         }
     }
@@ -459,10 +436,28 @@ fn build_ui(
     // Phase 8: Clean up browser daemon on app shutdown.
     // connect_shutdown fires while GTK is still alive and runtime handle is valid,
     // ensuring the daemon gets a clean shutdown command before tokio tasks are cancelled.
+    // The session is written here too, while GTK and the state are still alive.
     {
         let state_for_shutdown = state.clone();
         app.connect_shutdown(move |_| {
-            state_for_shutdown.borrow_mut().shutdown_browser();
+            if let Ok(mut s) = state_for_shutdown.try_borrow_mut() {
+                s.flush_session();
+                s.shutdown_browser();
+            }
+        });
+    }
+
+    // Signals that end the process without a GTK close (kill, terminal hangup, Ctrl+C) save the
+    // layout first, then quit through the normal path. The flush runs on the GLib main loop.
+    for signum in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        let state_for_signal = state.clone();
+        let app_for_signal = app.clone();
+        let _ = glib::unix_signal_add_local(signum, move || {
+            if let Ok(s) = state_for_signal.try_borrow() {
+                s.flush_session();
+            }
+            app_for_signal.quit();
+            glib::ControlFlow::Break
         });
     }
 
@@ -472,25 +467,13 @@ fn build_ui(
     crate::socket::start_socket_server(&runtime_handle, state.clone(), cmd_tx);
 
     // 5. Handle delete-event for close confirmation
+    // Window close (the X button, or the last window closing) saves the session before it proceeds.
     window.connect_close_request({
         let state = state.clone();
         move |_win| {
-            let count = state.borrow().workspaces.len();
-            if count == 0 {
-                return gtk4::glib::Propagation::Proceed;
+            if let Ok(s) = state.try_borrow() {
+                s.flush_session();
             }
-            // Show close confirmation dialog.
-            // let dialog = gtk4::AlertDialog::builder()
-            //     .message("Close Workspace?")
-            //     .detail("All panes in this workspace will be closed. This cannot be undone.")
-            //     .modal(true)
-            //     .build();
-            // dialog.set_buttons(&["Keep Workspace", "Close Workspace"]);
-            // dialog.set_default_button(0);
-            // dialog.set_cancel_button(0);
-
-            // For window close, just allow it — full per-workspace dialog wired in shortcuts.rs.
-            // This dialog is for the window X button — proceed to close.
             gtk4::glib::Propagation::Proceed
         }
     });

@@ -194,7 +194,7 @@ pub fn handle_socket_command(
             };
             match idx {
                 Some(i) => {
-                    state.borrow_mut().switch_to_index(i);
+                    state.borrow_mut().select_workspace(i);
                     let _ = resp_tx.send(ok(req_id, json!({})));
                 }
                 None => {
@@ -273,19 +273,7 @@ pub fn handle_socket_command(
             let idx = s.workspaces.iter().position(|ws| ws.uuid.to_string() == id);
             match idx {
                 Some(from) => {
-                    let to = position.min(s.workspaces.len().saturating_sub(1));
-                    let ws = s.workspaces.remove(from);
-                    let engine = s.split_engines.remove(from);
-                    s.workspaces.insert(to, ws);
-                    s.split_engines.insert(to, engine);
-                    // Adjust active_index after reorder.
-                    if from == s.active_index {
-                        s.active_index = to;
-                    } else if from < s.active_index && to >= s.active_index {
-                        s.active_index -= 1;
-                    } else if from > s.active_index && to <= s.active_index {
-                        s.active_index += 1;
-                    }
+                    s.move_workspace(from, position);
                     drop(s);
                     let _ = resp_tx.send(ok(req_id, json!({})));
                 }
@@ -314,7 +302,7 @@ pub fn handle_socket_command(
         SocketCommand::DebugLayout { req_id, resp_tx } => {
             // SOCK-05: No focus side effects.
             let s = state.borrow();
-            match s.split_engines.get(s.active_index) {
+            match s.active_split_engine() {
                 Some(engine) => {
                     let data = engine.root.to_data();
                     let json_tree = serde_json::to_value(&data).unwrap_or(Value::Null);
@@ -330,7 +318,7 @@ pub fn handle_socket_command(
         SocketCommand::DebugType { req_id, text, resp_tx } => {
             // SOCK-05: No focus side effects (sends text to active surface without changing focus).
             let s = state.borrow();
-            if let Some(engine) = s.split_engines.get(s.active_index) {
+            if let Some(engine) = s.active_split_engine() {
                 if let Some(pane_id) = engine.root.find_active_pane_id() {
                     if let Some(surface) = engine.root.find_surface_for_pane(pane_id) {
                         if !surface.is_null() {
@@ -353,16 +341,7 @@ pub fn handle_socket_command(
         SocketCommand::SurfaceList { req_id, resp_tx } => {
             // SOCK-05: No focus side effects.
             let s = state.borrow();
-            let mut panes: Vec<Value> = Vec::new();
-            for (ws_idx, (ws, engine)) in s.workspaces.iter().zip(s.split_engines.iter()).enumerate() {
-                for (pane_uuid, _pane_id, active) in engine.all_panes() {
-                    panes.push(json!({
-                        "uuid": pane_uuid.to_string(),
-                        "workspace_uuid": ws.uuid.to_string(),
-                        "active": active && ws_idx == s.active_index,
-                    }));
-                }
-            }
+            let panes = pane_listing(&s);
             let _ = resp_tx.send(ok(req_id, json!({"surfaces": panes})));
         }
 
@@ -376,8 +355,7 @@ pub fn handle_socket_command(
             };
             let result = {
                 let mut s = state.borrow_mut();
-                let idx = s.active_index;
-                if let Some(engine) = s.split_engines.get_mut(idx) {
+                if let Some(engine) = s.active_split_engine_mut() {
                     engine.split_active(orientation)
                         .and_then(|new_pane_id| {
                             // Find the uuid of the newly created pane.
@@ -403,14 +381,13 @@ pub fn handle_socket_command(
             // SOCK-05: surface.focus IS a focus-intent command — allowed to change focus.
             let pane_id = {
                 let s = state.borrow();
-                s.split_engines.get(s.active_index)
+                s.active_split_engine()
                     .and_then(|engine| engine.find_pane_id_by_uuid(&id))
             };
             match pane_id {
                 Some(pid) => {
                     let mut s = state.borrow_mut();
-                    let idx = s.active_index;
-                    if let Some(engine) = s.split_engines.get_mut(idx) {
+                    if let Some(engine) = s.active_split_engine_mut() {
                         engine.active_pane_id = pid;
                         engine.root.update_focus_css(pid);
                         engine.grab_active_focus();
@@ -426,15 +403,14 @@ pub fn handle_socket_command(
             // Close pane by uuid. Set it as active, then close_active().
             let pane_id = {
                 let s = state.borrow();
-                s.split_engines.get(s.active_index)
+                s.active_split_engine()
                     .and_then(|engine| engine.find_pane_id_by_uuid(&id))
             };
             match pane_id {
                 Some(pid) => {
                     let result = {
                         let mut s = state.borrow_mut();
-                        let idx = s.active_index;
-                        if let Some(engine) = s.split_engines.get_mut(idx) {
+                        if let Some(engine) = s.active_split_engine_mut() {
                             engine.active_pane_id = pid;
                             engine.root.update_focus_css(pid);
                             engine.close_active()
@@ -455,7 +431,7 @@ pub fn handle_socket_command(
             // SOCK-05: send_text is NOT a focus-intent command — NO focus change.
             let surface = {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     if let Some(ref uuid_str) = id {
                         engine.find_surface_by_uuid(uuid_str)
                     } else {
@@ -485,7 +461,7 @@ pub fn handle_socket_command(
             // Complex key combos (ctrl+c, etc.) require ghostty_surface_key — Phase 4.
             let surface = {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     if let Some(ref uuid_str) = id {
                         engine.find_surface_by_uuid(uuid_str)
                     } else {
@@ -519,7 +495,7 @@ pub fn handle_socket_command(
             // SOCK-05: health is NOT focus-intent — NO focus change.
             let (found, has_attention) = {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     if let Some(ref uuid_str) = id {
                         let alive = engine.find_surface_by_uuid(uuid_str).is_some();
                         let attn = engine.find_pane_id_by_uuid(uuid_str)
@@ -542,7 +518,7 @@ pub fn handle_socket_command(
             // Queue a render on the target surface's GLArea.
             let gl_area = {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     let target_pane_id = if let Some(ref uuid_str) = id {
                         engine.find_pane_id_by_uuid(uuid_str)
                     } else {
@@ -561,16 +537,7 @@ pub fn handle_socket_command(
         SocketCommand::PaneList { req_id, resp_tx } => {
             // SOCK-05: No focus side effects. Alias for surface.list.
             let s = state.borrow();
-            let mut panes: Vec<Value> = Vec::new();
-            for (ws_idx, (ws, engine)) in s.workspaces.iter().zip(s.split_engines.iter()).enumerate() {
-                for (pane_uuid, _pane_id, active) in engine.all_panes() {
-                    panes.push(json!({
-                        "uuid": pane_uuid.to_string(),
-                        "workspace_uuid": ws.uuid.to_string(),
-                        "active": active && ws_idx == s.active_index,
-                    }));
-                }
-            }
+            let panes = pane_listing(&s);
             let _ = resp_tx.send(ok(req_id, json!({"panes": panes})));
         }
 
@@ -578,15 +545,14 @@ pub fn handle_socket_command(
             // SOCK-05: pane.focus IS focus-intent — allowed to change focus.
             let pane_id = {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     id.as_ref().and_then(|uuid_str| engine.find_pane_id_by_uuid(uuid_str))
                 } else { None }
             };
             match pane_id {
                 Some(pid) => {
                     let mut s = state.borrow_mut();
-                    let idx = s.active_index;
-                    if let Some(engine) = s.split_engines.get_mut(idx) {
+                    if let Some(engine) = s.active_split_engine_mut() {
                         engine.active_pane_id = pid;
                         engine.root.update_focus_css(pid);
                         engine.grab_active_focus();
@@ -603,7 +569,7 @@ pub fn handle_socket_command(
             // Phase 3 stub: re-grab focus on current active pane. Phase 4 tracks focus history.
             {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     engine.grab_active_focus();
                 }
             }
@@ -868,6 +834,27 @@ pub fn handle_socket_command(
 }
 
 /// Walk the split tree to find the first Preview node's Picture widget.
+/// One entry per pane of every built tab. `active` marks the focused pane of the visible tab.
+fn pane_listing(s: &crate::app_state::AppState) -> Vec<Value> {
+    let mut panes = Vec::new();
+    for (ws_idx, ws) in s.workspaces.iter().enumerate() {
+        for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+            let Some(engine) = tab.engine.as_ref() else {
+                continue;
+            };
+            let visible = ws_idx == s.active_index && tab_idx == ws.active_tab;
+            for (pane_uuid, _pane_id, active) in engine.all_panes() {
+                panes.push(json!({
+                    "uuid": pane_uuid.to_string(),
+                    "workspace_uuid": ws.uuid.to_string(),
+                    "active": active && visible,
+                }));
+            }
+        }
+    }
+    panes
+}
+
 fn find_preview_picture(node: &crate::split_engine::SplitNode) -> Option<gtk4::Picture> {
     match node {
         crate::split_engine::SplitNode::Preview { picture, .. } => Some(picture.clone()),

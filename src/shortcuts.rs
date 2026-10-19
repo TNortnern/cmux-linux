@@ -196,21 +196,11 @@ pub fn handle_split(state: &Rc<RefCell<AppState>>, vertical: bool) {
     }
 }
 
-/// Close the active pane (Ctrl+Shift+X).
-pub fn handle_close_pane(state: &Rc<RefCell<AppState>>, app: &gtk4::Application) {
-    let (close_workspace, active_index) = {
-        let mut s = state.borrow_mut();
-        if let Some(engine) = s.active_split_engine_mut() {
-            match engine.close_active() {
-                None => (true, s.active_index), // last pane -> close workspace
-                Some(_) => (false, 0),
-            }
-        } else {
-            (false, 0)
-        }
-    };
-    if close_workspace {
-        handle_close_workspace(state, app);
+/// Close the active pane (Ctrl+Shift+X). The last pane of a tab closes the tab; AppState handles that.
+pub fn handle_close_pane(state: &Rc<RefCell<AppState>>, _app: &gtk4::Application) {
+    let active_pane = state.borrow().active_split_engine().map(|e| e.active_pane_id);
+    if let Some(pane_id) = active_pane {
+        state.borrow_mut().close_pane(pane_id);
     }
 }
 

@@ -941,6 +941,8 @@ impl SplitEngine {
     pub fn gl_area_for_pane(&self, pane_id: u64) -> Option<gtk4::GLArea> {
         find_gl_area_in_tree(&self.root, pane_id)
     }
+
+    pub fn set_visible(&self, _visible: bool) {}
 }
 
 // ── Tree traversal helpers ───────────────────────────────────────────────────
