@@ -115,6 +115,37 @@ pub unsafe extern "C" fn action_cb(
         return true;
     }
 
+    // The shell reported its folder (OSC 7 via shell integration). This runs on Ghostty's thread,
+    // not the GLib main thread, so it only writes the pane's Mutex-guarded track. The pane
+    // context is valid here: teardown_pane frees the surface before it frees the context, and
+    // Ghostty reports only on a live surface.
+    if action.tag == ffi::ghostty_action_tag_e_GHOSTTY_ACTION_PWD {
+        if _target.tag == ffi::ghostty_target_tag_e_GHOSTTY_TARGET_SURFACE {
+            let surface = unsafe { _target.target.surface };
+            let ctx = unsafe { ffi::ghostty_surface_userdata(surface) } as *const PaneCtx;
+            let pwd = unsafe { action.action.pwd.pwd };
+            if let Some(ctx) = unsafe { ctx.as_ref() } {
+                let reported = if pwd.is_null() {
+                    None
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(pwd) }.to_str().ok()
+                };
+                if let Some(path) = reported.filter(|p| p.starts_with('/')) {
+                    if let Ok(mut track) = ctx.track.lock() {
+                        if !track.remote {
+                            track.cwd = Some(path.to_owned());
+                        }
+                    }
+                    // Session save belongs on the main thread (the save itself is debounced).
+                    glib::idle_add_once(|| {
+                        // T1: crate::app_state::request_session_save();
+                    });
+                }
+            }
+        }
+        return true;
+    }
+
     if action.tag == ffi::ghostty_action_tag_e_GHOSTTY_ACTION_RENDER {
         // Trigger a render on the GLArea — will call ghostty_surface_draw on main thread.
         if let Ok(areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {

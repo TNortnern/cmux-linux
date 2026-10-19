@@ -1,3 +1,4 @@
+use crate::ghostty::cwd::{self, PaneTrackCell};
 use crate::ghostty::ffi;
 use crate::ghostty::surface::{teardown_pane, PaneCtx, PaneSurface, SurfaceCell};
 use gtk4::prelude::*;
@@ -51,6 +52,8 @@ pub enum SplitNode {
         surface: SurfaceCell,
         /// Per-pane context shared with Ghostty as surface userdata. Freed by teardown_pane.
         ctx: *mut PaneCtx,
+        /// The pane's tracked folder and shell pid (same cell as `ctx.track`).
+        track: PaneTrackCell,
         /// Stable UUID for session persistence and v2 socket protocol pane identity.
         uuid: Uuid,
         /// Phase 4 NOTF-01: true when this pane has unread bell activity.
@@ -301,6 +304,19 @@ pub struct SplitEngine {
     app: gtk4::Application,
     /// Ghostty app handle needed to create new surfaces.
     ghostty_app: ffi::ghostty_app_t,
+    /// Set while a pane is zoomed (see `toggle_zoom`).
+    zoom: Option<ZoomState>,
+}
+
+/// What zoom hid, so that unzoom restores the layout exactly.
+struct ZoomState {
+    /// Sibling branches hidden to show only the zoomed pane.
+    hidden: Vec<gtk4::Widget>,
+    /// Divider positions at zoom time.
+    positions: Vec<(gtk4::Paned, i32)>,
+    /// Pane rectangles at zoom time, used for direction navigation while zoomed (the hidden
+    /// panes have no current bounds). None if the layout had no bounds yet.
+    rects: Option<Vec<(u64, Rect)>>,
 }
 
 impl SplitEngine {
@@ -319,6 +335,7 @@ impl SplitEngine {
             gl_area: pane.gl_area,
             surface: pane.surface,
             ctx: pane.ctx,
+            track: pane.track,
             uuid: Uuid::new_v4(),
             has_attention: false,
         };
@@ -329,6 +346,7 @@ impl SplitEngine {
             active_pane_id: pane_id,
             app,
             ghostty_app,
+            zoom: None,
         }
     }
 
@@ -353,6 +371,7 @@ impl SplitEngine {
             active_pane_id: active_id,
             app,
             ghostty_app,
+            zoom: None,
         })
     }
 
@@ -367,8 +386,11 @@ impl SplitEngine {
             return None;
         }
         match data {
-            SplitNodeData::Leaf { surface_uuid, .. } => {
+            SplitNodeData::Leaf { surface_uuid, cwd, .. } => {
                 let pane_id = alloc_pane_id();
+                // Saved folder. create_surface checks that it is an existing absolute directory
+                // and otherwise starts the shell in the default folder.
+                let saved_cwd = (!cwd.is_empty()).then(|| std::path::PathBuf::from(cwd.as_str()));
                 // The realize callback creates the Ghostty surface and fills the leaf's handle.
                 let pane = crate::ghostty::surface::create_surface(
                     app,
@@ -376,7 +398,7 @@ impl SplitEngine {
                     None,
                     pane_id,
                     crate::ghostty::surface::SurfaceIoMode::Exec,
-                    None,
+                    saved_cwd,
                 );
                 // Phase 9: Attach right-click context menu (D-08)
                 attach_terminal_context_menu(&pane.gl_area);
@@ -386,6 +408,7 @@ impl SplitEngine {
                     gl_area: pane.gl_area,
                     surface: pane.surface,
                     ctx: pane.ctx,
+                    track: pane.track,
                     uuid: *surface_uuid,
                     has_attention: false,
                 })
@@ -439,15 +462,111 @@ impl SplitEngine {
     /// there is nothing to sync from the registry. Kept only because main.rs still calls it.
     pub fn sync_surfaces_from_registry(&mut self) {}
 
-    /// Returns the root widget of this workspace's split tree.
-    /// Current working directory of the focused pane, as last reported by its shell.
-    /// STUB: package T2 implements (ghostty PWD action / OSC 7).
+    /// Current working directory of the focused pane: the folder its shell reported (OSC 7),
+    /// else what /proc shows for its shell. None if neither is known.
     pub fn focused_cwd(&self) -> Option<std::path::PathBuf> {
-        None
+        match self.root.find_node(self.active_pane_id)? {
+            SplitNode::Leaf { pane_id, track, .. } => cwd::pane_cwd(*pane_id, track),
+            _ => None,
+        }
     }
 
+    /// Returns the root widget of this workspace's split tree.
     pub fn root_widget(&self) -> gtk4::Widget {
         self.root.widget()
+    }
+
+    /// Stops (`false`) or resumes (`true`) rendering of every pane in this engine. A hidden
+    /// tab calls this with `false` so Ghostty stops drawing its panes; showing again refreshes them.
+    #[allow(dead_code)] // Stage 2: called once the tab package wires it up.
+    pub fn set_visible(&self, visible: bool) {
+        let mut surfaces = Vec::new();
+        collect_surfaces(&self.root, &mut surfaces);
+        for surface in surfaces {
+            unsafe {
+                ffi::ghostty_surface_set_occlusion(surface, visible);
+                if visible {
+                    ffi::ghostty_surface_refresh(surface);
+                }
+            }
+        }
+    }
+
+    /// Grows the active pane toward `direction` by `step_px`, by moving the nearest divider
+    /// with the matching orientation. Returns true if a divider moved. Un-zooms first.
+    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
+    pub fn resize_active(&mut self, direction: FocusDirection, step_px: i32) -> bool {
+        if step_px <= 0 {
+            return false;
+        }
+        self.unzoom();
+        resize_in(&self.root, self.active_pane_id, direction, step_px)
+    }
+
+    /// Sets every divider to its leaf-count weighted position (left leaves / total leaves).
+    /// Un-zooms first.
+    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
+    pub fn equalize(&mut self) {
+        self.unzoom();
+        equalize_node(&self.root);
+    }
+
+    /// Shows only the active pane (hides the other branches), or restores the layout when
+    /// already zoomed. Returns true if the zoom state changed; false with nothing to zoom.
+    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
+    pub fn toggle_zoom(&mut self) -> bool {
+        if self.is_zoomed() {
+            self.unzoom();
+            return true;
+        }
+        let rects = leaf_rects(&self.root);
+        self.apply_zoom(rects)
+    }
+
+    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
+    pub fn is_zoomed(&self) -> bool {
+        self.zoom.is_some()
+    }
+
+    /// Hides every branch on the path to the active pane. Returns false if nothing was hidden.
+    fn apply_zoom(&mut self, rects: Option<Vec<(u64, Rect)>>) -> bool {
+        let mut state = ZoomState {
+            hidden: Vec::new(),
+            positions: Vec::new(),
+            rects,
+        };
+        hide_off_path(&self.root, self.active_pane_id, &mut state);
+        if state.hidden.is_empty() {
+            return false;
+        }
+        for widget in &state.hidden {
+            widget.set_visible(false);
+        }
+        self.zoom = Some(state);
+        true
+    }
+
+    /// Restores everything zoom hid, and the divider positions. No-op when not zoomed.
+    fn unzoom(&mut self) {
+        let Some(state) = self.zoom.take() else {
+            return;
+        };
+        for widget in &state.hidden {
+            widget.set_visible(true);
+        }
+        for (paned, position) in &state.positions {
+            paned.set_position(*position);
+        }
+    }
+
+    /// Splits the active pane along its longer side: side by side when it is wider than tall.
+    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
+    pub fn split_auto(&mut self) -> Option<u64> {
+        let orientation = match self.gl_area_for_pane(self.active_pane_id) {
+            Some(area) => auto_split_orientation(area.width(), area.height()),
+            None => gtk4::Orientation::Horizontal,
+        };
+        self.split_active(orientation)
     }
 
     /// Grab GTK keyboard focus for the active pane's GLArea.
@@ -503,7 +622,10 @@ impl SplitEngine {
     }
 
     pub fn split_active(&mut self, orientation: gtk4::Orientation) -> Option<u64> {
+        self.unzoom();
         let active_id = self.active_pane_id;
+        // The new pane opens in the focused pane's folder.
+        let start_dir = self.focused_cwd();
 
         // When the root is a Leaf (first split), the GLArea is a direct child of the GtkStack
         // page. The replacer will remove it from the Stack (via remove_widget_from_parent) and
@@ -551,7 +673,7 @@ impl SplitEngine {
             Some(inherited_config),
             new_pane_id,
             crate::ghostty::surface::SurfaceIoMode::Exec,
-            None,
+            start_dir,
         );
         // Phase 9: Attach right-click context menu (D-08)
         attach_terminal_context_menu(&pane.gl_area);
@@ -563,6 +685,7 @@ impl SplitEngine {
             gl_area: pane.gl_area,
             surface: pane.surface,
             ctx: pane.ctx,
+            track: pane.track,
             uuid: Uuid::new_v4(),
             has_attention: false,
         };
@@ -591,6 +714,7 @@ impl SplitEngine {
     /// Returns (new_pane_id, picture_widget, url_entry) so the caller can wire streaming and URL navigation.
     /// The active terminal pane stays on the left and retains focus.
     pub fn split_active_with_preview(&mut self) -> Option<crate::browser::PreviewPaneWidgets> {
+        self.unzoom();
         let active_id = self.active_pane_id;
         let new_pane_id = alloc_pane_id();
 
@@ -825,6 +949,9 @@ impl SplitEngine {
             return CloseResult::LastPane;
         }
 
+        // Restore the layout first: zoom may have hidden the pane being closed or its sibling.
+        self.unzoom();
+
         // Tear down the surface and GL state while the widget is still in the tree.
         if let Some(SplitNode::Leaf { gl_area, surface, ctx, .. }) = self.root.find_node(target_id) {
             teardown_pane(gl_area, surface, *ctx);
@@ -883,9 +1010,22 @@ impl SplitEngine {
     }
 
     /// Navigate focus to the pane adjacent in `direction` (Ctrl+Alt+arrows per D-10).
+    /// Picks the geometrically nearest pane in `direction`. Falls back to tree order when pane
+    /// bounds are not available yet. While zoomed, the layout captured at zoom time is used and
+    /// the zoom follows the new pane.
     pub fn focus_next_in_direction(&mut self, direction: FocusDirection) -> bool {
         let active_id = self.active_pane_id;
-        if let Some(new_id) = find_adjacent(&self.root, active_id, direction) {
+        let zoomed_rects = self.zoom.as_ref().map(|z| z.rects.clone());
+        let rects = match &zoomed_rects {
+            Some(rects) => rects.clone(),
+            None => leaf_rects(&self.root),
+        };
+        let next = match rects {
+            Some(rects) => pick_neighbor(&rects, active_id, direction),
+            None => find_adjacent(&self.root, active_id, direction),
+        };
+        if let Some(new_id) = next {
+            self.unzoom();
             // Unfocus old surface.
             if let Some(old_surface) = self.find_surface(active_id) {
                 unsafe {
@@ -904,6 +1044,10 @@ impl SplitEngine {
                 gl_area.grab_focus();
             } else if let Some(entry) = find_url_entry_in_tree(&self.root, new_id) {
                 entry.grab_focus();
+            }
+            // Zoom follows focus: re-hide the branches around the new pane.
+            if let Some(rects) = zoomed_rects {
+                self.apply_zoom(rects);
             }
             true
         } else {
@@ -963,6 +1107,7 @@ where
                         gl_area: gtk4::GLArea::new(),
                         surface: Rc::new(RefCell::new(None)),
                         ctx: std::ptr::null_mut(),
+                        track: cwd::new_track(),
                         uuid: Uuid::new_v4(),
                         has_attention: false,
                     },
@@ -1165,10 +1310,212 @@ fn find_url_entry_in_tree(node: &SplitNode, pane_id: u64) -> Option<gtk4::Entry>
     }
 }
 
-/// Find the pane adjacent to `active_id` in `direction`.
-/// Strategy: collect ordered leaf positions and find the neighbor.
-/// This is a directional approximation: Left/Up = previous leaf, Right/Down = next leaf.
-/// A full spatial algorithm (comparing widget coordinates) can be added in a future phase.
+/// Axis-aligned rectangle, in the coordinates of the engine's root widget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Rect {
+    fn right(&self) -> f64 {
+        self.x + self.w
+    }
+
+    fn bottom(&self) -> f64 {
+        self.y + self.h
+    }
+
+    fn center(&self) -> (f64, f64) {
+        (self.x + self.w / 2.0, self.y + self.h / 2.0)
+    }
+}
+
+/// Tolerance in pixels for edges that should touch.
+const EDGE_EPS: f64 = 0.5;
+
+/// Picks the pane nearest to `active` in `direction`. A candidate must lie beyond the active
+/// pane's edge in that direction and overlap it on the other axis. The nearest gap wins; ties
+/// go to the candidate whose centre is closest on the other axis. None if no pane lies that way.
+pub fn pick_neighbor(rects: &[(u64, Rect)], active: u64, direction: FocusDirection) -> Option<u64> {
+    let (_, a) = *rects.iter().find(|(id, _)| *id == active)?;
+    let (ax, ay) = a.center();
+    rects
+        .iter()
+        .filter(|(id, _)| *id != active)
+        .filter_map(|(id, c)| {
+            let (cx, cy) = c.center();
+            let vertical_overlap = a.y < c.bottom() && c.y < a.bottom();
+            let horizontal_overlap = a.x < c.right() && c.x < a.right();
+            let (gap, overlaps, offset) = match direction {
+                FocusDirection::Right => (c.x - a.right(), vertical_overlap, cy - ay),
+                FocusDirection::Left => (a.x - c.right(), vertical_overlap, cy - ay),
+                FocusDirection::Down => (c.y - a.bottom(), horizontal_overlap, cx - ax),
+                FocusDirection::Up => (a.y - c.bottom(), horizontal_overlap, cx - ax),
+            };
+            (gap >= -EDGE_EPS && overlaps).then_some((*id, gap.max(0.0), offset.abs()))
+        })
+        .min_by(|x, y| x.1.total_cmp(&y.1).then(x.2.total_cmp(&y.2)))
+        .map(|(id, _, _)| id)
+}
+
+/// Orientation for splitting a pane of the given size along its longer side. Wider than tall
+/// splits side by side (a horizontal Paned).
+pub fn auto_split_orientation(width: i32, height: i32) -> gtk4::Orientation {
+    if width >= height {
+        gtk4::Orientation::Horizontal
+    } else {
+        gtk4::Orientation::Vertical
+    }
+}
+
+/// Divider position that gives the start side its share of the leaves: `left / total` of `size`.
+pub fn weighted_position(size: i32, left_leaves: usize, total_leaves: usize) -> i32 {
+    if total_leaves == 0 {
+        return size / 2;
+    }
+    (size as f64 * left_leaves as f64 / total_leaves as f64).round() as i32
+}
+
+fn count_leaves(node: &SplitNode) -> usize {
+    match node {
+        SplitNode::Leaf { .. } | SplitNode::Preview { .. } => 1,
+        SplitNode::Split { start, end, .. } => count_leaves(start) + count_leaves(end),
+    }
+}
+
+/// Size of a Paned along its orientation (width for horizontal, height for vertical).
+fn paned_size(paned: &gtk4::Paned, orientation: gtk4::Orientation) -> i32 {
+    if orientation == gtk4::Orientation::Horizontal {
+        paned.width()
+    } else {
+        paned.height()
+    }
+}
+
+/// Moves the nearest divider along `direction` so the active pane grows. Dividers deeper in
+/// the tree are tried first. Returns true if a divider was moved.
+fn resize_in(node: &SplitNode, active: u64, direction: FocusDirection, step: i32) -> bool {
+    let SplitNode::Split { orientation, paned, start, end } = node else {
+        return false;
+    };
+    let in_start = start.find_node(active).is_some();
+    if !in_start && end.find_node(active).is_none() {
+        return false;
+    }
+    let child = if in_start { start } else { end };
+    if resize_in(child, active, direction, step) {
+        return true;
+    }
+    // The divider must sit on the side of the active pane that the direction points at.
+    let axis = match direction {
+        FocusDirection::Left | FocusDirection::Right => gtk4::Orientation::Horizontal,
+        FocusDirection::Up | FocusDirection::Down => gtk4::Orientation::Vertical,
+    };
+    let delta = match (direction, in_start) {
+        (FocusDirection::Right | FocusDirection::Down, true) => step,
+        (FocusDirection::Left | FocusDirection::Up, false) => -step,
+        _ => return false,
+    };
+    if *orientation != axis {
+        return false;
+    }
+    let size = paned_size(paned, *orientation);
+    if size <= 0 {
+        return false;
+    }
+    paned.set_position((paned.position() + delta).clamp(0, size));
+    true
+}
+
+/// Sets each divider in the subtree to its leaf-count weighted position. A divider whose
+/// size is not known yet is set after the next layout pass.
+fn equalize_node(node: &SplitNode) {
+    let SplitNode::Split { orientation, paned, start, end } = node else {
+        return;
+    };
+    let orientation = *orientation;
+    let left = count_leaves(start);
+    let total = left + count_leaves(end);
+    let size = paned_size(paned, orientation);
+    if size > 0 {
+        paned.set_position(weighted_position(size, left, total));
+    } else {
+        let paned = paned.clone();
+        gtk4::glib::idle_add_local_once(move || {
+            let size = paned_size(&paned, orientation);
+            if size > 0 {
+                paned.set_position(weighted_position(size, left, total));
+            }
+        });
+    }
+    equalize_node(start);
+    equalize_node(end);
+}
+
+/// Records, for every split on the path to `active`, the sibling branch to hide and the
+/// divider position. Nothing is changed here; the caller applies the record.
+fn hide_off_path(node: &SplitNode, active: u64, state: &mut ZoomState) {
+    let SplitNode::Split { paned, start, end, .. } = node else {
+        return;
+    };
+    let in_start = start.find_node(active).is_some();
+    if !in_start && end.find_node(active).is_none() {
+        return;
+    }
+    let (keep, hide) = if in_start { (start, end) } else { (end, start) };
+    hide_off_path(keep, active, state);
+    state.positions.push((paned.clone(), paned.position()));
+    state.hidden.push(hide.widget());
+}
+
+/// Bounds of every leaf in root coordinates, in tree order. None if any leaf has no
+/// allocation yet (not mapped), so the caller can fall back.
+fn leaf_rects(root: &SplitNode) -> Option<Vec<(u64, Rect)>> {
+    fn collect(node: &SplitNode, out: &mut Vec<(u64, gtk4::Widget)>) {
+        match node {
+            SplitNode::Leaf { pane_id, .. } | SplitNode::Preview { pane_id, .. } => {
+                out.push((*pane_id, node.widget()))
+            }
+            SplitNode::Split { start, end, .. } => {
+                collect(start, out);
+                collect(end, out);
+            }
+        }
+    }
+    let mut leaves = Vec::new();
+    collect(root, &mut leaves);
+    let reference = root.widget();
+    leaves
+        .into_iter()
+        .map(|(id, widget)| {
+            let b = widget.compute_bounds(&reference)?;
+            let rect = Rect {
+                x: b.x() as f64,
+                y: b.y() as f64,
+                w: b.width() as f64,
+                h: b.height() as f64,
+            };
+            (rect.w > 0.0 && rect.h > 0.0).then_some((id, rect))
+        })
+        .collect()
+}
+
+fn collect_surfaces(node: &SplitNode, out: &mut Vec<ffi::ghostty_surface_t>) {
+    match node {
+        SplitNode::Leaf { surface, .. } => out.extend(*surface.borrow()),
+        SplitNode::Preview { .. } => {}
+        SplitNode::Split { start, end, .. } => {
+            collect_surfaces(start, out);
+            collect_surfaces(end, out);
+        }
+    }
+}
+
+/// Find the pane adjacent to `active_id` in `direction` by tree order: Left/Up = previous leaf,
+/// Right/Down = next leaf. Used only when pane bounds are not available.
 fn find_adjacent(root: &SplitNode, active_id: u64, direction: FocusDirection) -> Option<u64> {
     let mut leaves = Vec::new();
     collect_leaves_in_order(root, &mut leaves);
@@ -1362,63 +1709,16 @@ fn combine_split(
     }
 }
 
-/// Best-effort CWD capture for a Ghostty surface via /proc.
-/// Walks /proc looking for child processes of the current process (cmux),
-/// then reads /proc/{pid}/cwd for the foreground shell.
-/// Never panics — falls back to $HOME or empty string.
-fn get_surface_cwd(surface: Option<ffi::ghostty_surface_t>) -> String {
-    if surface.is_none() {
-        return String::new();
-    }
-    // Try to find child shell processes by scanning /proc for children of our PID.
-    // Each Ghostty surface spawns a child shell — we look for processes whose
-    // parent is the cmux process and read their CWD.
-    let our_pid = std::process::id();
-    if let Ok(entries) = std::fs::read_dir("/proc") {
-        // Collect candidate child PIDs (children of our process)
-        let mut candidates: Vec<u32> = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if let Ok(pid) = name.to_string_lossy().parse::<u32>() {
-                // Read /proc/{pid}/stat to check parent PID
-                if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                    // Format: pid (comm) state ppid ...
-                    // Find the closing paren then parse ppid
-                    if let Some(after_comm) = stat.rfind(')') {
-                        let fields: Vec<&str> = stat[after_comm + 2..].split_whitespace().collect();
-                        if fields.len() >= 2 {
-                            if let Ok(ppid) = fields[1].parse::<u32>() {
-                                if ppid == our_pid {
-                                    candidates.push(pid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Use the last (most recent) child process CWD as best guess.
-        // In practice, each surface has one direct child shell.
-        for pid in candidates.iter().rev() {
-            if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-                let cwd_str = cwd.to_string_lossy().to_string();
-                if !cwd_str.is_empty() {
-                    return cwd_str;
-                }
-            }
-        }
-    }
-    // Fallback to $HOME
-    std::env::var("HOME").unwrap_or_default()
-}
-
 impl SplitNode {
     /// Session snapshot of this subtree. Preview panes are ephemeral and are skipped; a split
     /// left with one child collapses to that child. Returns None when no terminal is left.
     pub fn to_session_data(&self) -> Option<SplitNodeData> {
         match self {
-            SplitNode::Leaf { pane_id, uuid, surface, .. } => {
-                let cwd = get_surface_cwd(*surface.borrow());
+            SplitNode::Leaf { pane_id, uuid, track, .. } => {
+                // The pane's tracked folder; empty when unknown (restore then uses the default).
+                let cwd = cwd::pane_cwd(*pane_id, track)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
                 Some(SplitNodeData::Leaf {
                     pane_id: *pane_id,
@@ -1596,5 +1896,92 @@ mod tests {
         // Closing a preview while one terminal remains is fine.
         assert!(!would_close_last_terminal(1, false));
         assert!(!would_close_last_terminal(0, false));
+    }
+
+    #[test]
+    fn weighted_position_follows_leaf_counts() {
+        // Two leaves: half. Three leaves split 1 | 2: a third, then two thirds.
+        assert_eq!(weighted_position(1000, 1, 2), 500);
+        assert_eq!(weighted_position(900, 1, 3), 300);
+        assert_eq!(weighted_position(900, 2, 3), 600);
+        // Four leaves split 3 | 1 (a left subtree of three panes beside one pane).
+        assert_eq!(weighted_position(800, 3, 4), 600);
+        assert_eq!(weighted_position(0, 1, 2), 0);
+        assert_eq!(weighted_position(100, 0, 0), 50);
+    }
+
+    #[test]
+    fn auto_split_follows_longer_side() {
+        assert_eq!(auto_split_orientation(900, 400), gtk4::Orientation::Horizontal);
+        assert_eq!(auto_split_orientation(400, 900), gtk4::Orientation::Vertical);
+        assert_eq!(auto_split_orientation(500, 500), gtk4::Orientation::Horizontal);
+    }
+
+    /// Four panes in a 2x2 grid, plus one far to the lower right that shares no edge with
+    /// pane 1 on either axis.
+    fn grid() -> Vec<(u64, Rect)> {
+        let r = |x: f64, y: f64| Rect { x, y, w: 100.0, h: 100.0 };
+        vec![
+            (1, r(0.0, 0.0)),
+            (2, r(110.0, 0.0)),
+            (3, r(0.0, 110.0)),
+            (4, r(110.0, 110.0)),
+            (5, r(400.0, 400.0)),
+        ]
+    }
+
+    #[test]
+    fn direction_picks_adjacent_pane_in_grid() {
+        let rects = grid();
+        assert_eq!(pick_neighbor(&rects, 1, FocusDirection::Right), Some(2));
+        assert_eq!(pick_neighbor(&rects, 1, FocusDirection::Down), Some(3));
+        assert_eq!(pick_neighbor(&rects, 4, FocusDirection::Left), Some(3));
+        assert_eq!(pick_neighbor(&rects, 4, FocusDirection::Up), Some(2));
+    }
+
+    #[test]
+    fn direction_is_none_at_the_edge() {
+        let rects = grid();
+        assert_eq!(pick_neighbor(&rects, 1, FocusDirection::Left), None);
+        assert_eq!(pick_neighbor(&rects, 1, FocusDirection::Up), None);
+        // Pane 5 sits below-right of the grid; nothing lies to its right.
+        assert_eq!(pick_neighbor(&rects, 5, FocusDirection::Right), None);
+    }
+
+    #[test]
+    fn direction_ignores_panes_without_overlap() {
+        // Pane 5 is to the right of pane 1 but below it: no vertical overlap, so it is not a
+        // Right neighbour even though it is nearer by tree order.
+        let rects = grid();
+        assert_eq!(pick_neighbor(&rects, 1, FocusDirection::Right), Some(2));
+        let lone = vec![
+            (1, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }),
+            (5, Rect { x: 110.0, y: 300.0, w: 100.0, h: 100.0 }),
+        ];
+        assert_eq!(pick_neighbor(&lone, 1, FocusDirection::Right), None);
+    }
+
+    #[test]
+    fn direction_prefers_nearest_then_most_aligned() {
+        let rects = vec![
+            (1, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }),
+            (2, Rect { x: 250.0, y: 0.0, w: 100.0, h: 100.0 }),
+            (3, Rect { x: 110.0, y: 0.0, w: 100.0, h: 100.0 }),
+        ];
+        // Pane 3 is nearer than pane 2.
+        assert_eq!(pick_neighbor(&rects, 1, FocusDirection::Right), Some(3));
+
+        // Equal gaps: the candidate whose centre lines up with the active pane wins.
+        let rects = vec![
+            (1, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }),
+            (2, Rect { x: 110.0, y: 50.0, w: 100.0, h: 100.0 }),
+            (3, Rect { x: 110.0, y: 0.0, w: 100.0, h: 100.0 }),
+        ];
+        assert_eq!(pick_neighbor(&rects, 1, FocusDirection::Right), Some(3));
+    }
+
+    #[test]
+    fn direction_unknown_active_pane_is_none() {
+        assert_eq!(pick_neighbor(&grid(), 99, FocusDirection::Right), None);
     }
 }
