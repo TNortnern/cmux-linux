@@ -85,6 +85,24 @@ pub struct ShortcutConfig {
 pub struct UiConfig {
     #[serde(default)]
     pub header_bar: HeaderBarConfig,
+    /// GTK renderer: "auto" (default), "gl" or "cairo". "auto" picks cairo when the machine has
+    /// no GPU render node (VMs, WSL, servers): GL is Mesa's software rasterizer there anyway, and
+    /// drawing GTK's own widgets with cairo instead saved ~20% RSS. Requires restart.
+    #[serde(default = "default_renderer")]
+    pub renderer: String,
+}
+
+fn default_renderer() -> String {
+    "auto".to_string()
+}
+
+/// Whether GTK should draw with cairo. `has_gpu_node` is whether /dev/dri/renderD* exists.
+pub fn use_cairo_renderer(setting: &str, has_gpu_node: bool) -> bool {
+    match setting {
+        "cairo" => true,
+        "gl" => false,
+        _ => !has_gpu_node,
+    }
 }
 
 /// Header bar configuration -- [ui.header_bar] in config.toml (D-16).
@@ -216,7 +234,7 @@ fn parse_config(content: &str, path: &std::path::Path) -> Config {
     warn_unknown_shortcuts(&root);
 
     let ui = match sub_table(&root, "ui") {
-        Some(ui) => UiConfig { header_bar: lenient(ui, "header_bar") },
+        Some(ui) => UiConfig { header_bar: lenient(ui, "header_bar"), renderer: lenient(ui, "renderer") },
         None => UiConfig::default(),
     };
 
@@ -486,5 +504,13 @@ buttons_right = ["split_right", "toggle_sidebar"]
         let smap = ShortcutMap::from_config(&config);
         assert_eq!(smap.lookup(ModifierType::CONTROL_MASK, Key::t), Some(ShortcutAction::NewWorkspace));
         assert_eq!(smap.lookup(ModifierType::CONTROL_MASK, Key::n), None);
+    }
+
+    #[test]
+    fn renderer_auto_uses_cairo_only_without_gpu() {
+        assert!(super::use_cairo_renderer("auto", false));
+        assert!(!super::use_cairo_renderer("auto", true));
+        assert!(super::use_cairo_renderer("cairo", true));
+        assert!(!super::use_cairo_renderer("gl", false));
     }
 }

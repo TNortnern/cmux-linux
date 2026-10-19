@@ -140,6 +140,22 @@ fn main() {
     // Config is read before the runtime exists so that the runtime, the session
     // restore and ghostty's setup can all use it.
     let config = crate::config::load_config();
+
+    // Rendering defaults that only matter without a GPU (see UiConfig::renderer). Respect the
+    // user's own environment. Still single-threaded here, so set_var is sound.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        let has_gpu_node = std::fs::read_dir("/dev/dri")
+            .map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().starts_with("renderD")))
+            .unwrap_or(false);
+        if crate::config::use_cairo_renderer(&config.ui.renderer, has_gpu_node) {
+            std::env::set_var("GSK_RENDERER", "cairo");
+        }
+    }
+    // Mesa's software rasterizer (llvmpipe) starts one thread per core by default; two keep a
+    // terminal smooth. No effect on hardware drivers.
+    if std::env::var_os("LP_NUM_THREADS").is_none() {
+        std::env::set_var("LP_NUM_THREADS", "2");
+    }
     resolve_ghostty_resources_dir();
 
     // Socket I/O, session saves and ssh tunnels need only a few workers. The GTK main
