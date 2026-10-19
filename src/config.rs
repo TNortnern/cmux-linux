@@ -1,15 +1,52 @@
 use gtk4::gdk::{Key, ModifierType};
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
+/// Default scrollback per pane, in bytes. Ghostty's own default is 10 MB per pane.
+pub const DEFAULT_SCROLLBACK_BYTES: u64 = 2_000_000;
+
 /// Top-level config loaded from ~/.config/cmux/config.toml.
-/// Phase 5: shortcuts section only (D-07).
 #[derive(serde::Deserialize, Default, Debug)]
 pub struct Config {
     #[serde(default)]
     pub shortcuts: ShortcutConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub session: SessionConfig,
+    #[serde(default)]
+    pub terminal: TerminalConfig,
+}
+
+/// `[session]` -- workspaces, tabs and split layout are restored on the next launch.
+/// Shells are not kept alive; each pane restarts in its saved folder.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Set to false to start with an empty window (the saved session is ignored).
+    pub restore: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self { restore: true }
+    }
+}
+
+/// `[terminal]` -- settings passed to the embedded ghostty engine.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct TerminalConfig {
+    /// Scrollback kept per pane, in bytes. 0 disables scrollback.
+    pub scrollback_bytes: u64,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self { scrollback_bytes: DEFAULT_SCROLLBACK_BYTES }
+    }
 }
 
 /// Per-action shortcut overrides. Each value is a GTK accelerator string (e.g. "<Ctrl>n").
@@ -132,49 +169,102 @@ const MOD_MASK: ModifierType = ModifierType::from_bits_truncate(
 /// Returns the config file path.
 /// Respects $XDG_CONFIG_HOME/cmux/config.toml; falls back to ~/.config/cmux/config.toml (CFG-04).
 pub fn config_path() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{home}/.config")
-    });
-    PathBuf::from(base).join("cmux").join("config.toml")
+    config_path_from(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"))
+}
+
+/// Pure form of `config_path`, so the tests need not touch the process environment.
+fn config_path_from(xdg_config_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    let base = match xdg_config_home {
+        Some(xdg) => PathBuf::from(xdg),
+        None => PathBuf::from(home.unwrap_or_else(|| OsString::from("."))).join(".config"),
+    };
+    base.join("cmux").join("config.toml")
 }
 
 /// Load config from disk. Always returns a usable Config (D-10).
-/// Missing file is silent; read/parse errors warn to stderr and fall back to defaults.
+/// A missing file is silent. A read error or TOML syntax error warns and uses all defaults.
+/// A bad value only affects its own entry: it is reported and skipped, and the rest is kept.
 pub fn load_config() -> Config {
-    let path = config_path();
-    let content = match std::fs::read_to_string(&path) {
+    load_config_from(&config_path())
+}
+
+/// Load config from an explicit file path. See `load_config`.
+fn load_config_from(path: &std::path::Path) -> Config {
+    let content = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Config::default();
         }
         Err(e) => {
-            eprintln!("cmux: config read error at {}: {e}", path.display());
+            cmux_warn!("config read error at {}: {e}", path.display());
+            return Config::default();
+        }
+    };
+    parse_config(&content, path)
+}
+
+/// Parse config text. `path` is only used in messages.
+fn parse_config(content: &str, path: &std::path::Path) -> Config {
+    let root: toml::Table = match content.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            cmux_warn!("config parse error at {}: {e}; using defaults", path.display());
             return Config::default();
         }
     };
 
-    warn_unknown_shortcuts(&content);
+    warn_unknown_shortcuts(&root);
 
-    match toml::from_str::<Config>(&content) {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("cmux: config parse error at {}: {e}", path.display());
-            Config::default()
+    let ui = match sub_table(&root, "ui") {
+        Some(ui) => UiConfig { header_bar: lenient(ui, "header_bar") },
+        None => UiConfig::default(),
+    };
+
+    Config {
+        shortcuts: lenient(&root, "shortcuts"),
+        ui,
+        session: lenient(&root, "session"),
+        terminal: lenient(&root, "terminal"),
+    }
+}
+
+/// Returns `parent[name]` if it is a table. Otherwise warns (when set) and returns None.
+fn sub_table<'a>(parent: &'a toml::Table, name: &str) -> Option<&'a toml::Table> {
+    match parent.get(name)? {
+        toml::Value::Table(t) => Some(t),
+        _ => {
+            cmux_warn!("config: [{name}] must be a table, ignoring it");
+            None
         }
     }
 }
 
-/// Warn about unknown keys in the [shortcuts] table (D-03).
-fn warn_unknown_shortcuts(content: &str) {
-    let table: toml::Value = match content.parse() {
-        Ok(v) => v,
-        Err(_) => return, // Parse errors are reported by load_config
+/// Deserializes the table `parent[name]` one entry at a time. An entry that fails to
+/// parse is reported and dropped. The other entries are kept. All target types have
+/// defaults for every field, so a single-entry probe only fails on a bad value.
+fn lenient<T: DeserializeOwned + Default>(parent: &toml::Table, name: &str) -> T {
+    let Some(entries) = sub_table(parent, name) else {
+        return T::default();
     };
-    if let Some(shortcuts) = table.get("shortcuts").and_then(|v| v.as_table()) {
+    let mut good = toml::Table::new();
+    for (key, value) in entries {
+        let mut probe = toml::Table::new();
+        probe.insert(key.clone(), value.clone());
+        if toml::Value::Table(probe).try_into::<T>().is_ok() {
+            good.insert(key.clone(), value.clone());
+        } else {
+            cmux_warn!("config: invalid value for '{name}.{key}', ignoring it");
+        }
+    }
+    toml::Value::Table(good).try_into::<T>().unwrap_or_default()
+}
+
+/// Warn about unknown keys in the [shortcuts] table (D-03).
+fn warn_unknown_shortcuts(root: &toml::Table) {
+    if let Some(shortcuts) = root.get("shortcuts").and_then(|v| v.as_table()) {
         for key in shortcuts.keys() {
             if !KNOWN_SHORTCUTS.contains(&key.as_str()) {
-                eprintln!("cmux: unknown shortcut action '{}' in config, ignoring", key);
+                cmux_warn!("unknown shortcut action '{}' in config, ignoring", key);
             }
         }
     }
@@ -221,8 +311,8 @@ impl ShortcutMap {
                 map.insert((mods & MOD_MASK, key), *action);
             } else {
                 // D-11: invalid accelerator — warn and use default
-                eprintln!(
-                    "cmux: invalid shortcut '{}' for {}, using default '{}'",
+                cmux_warn!(
+                    "invalid shortcut '{}' for {}, using default '{}'",
                     accel_str, action_name, default_accel
                 );
                 if let Some((key, mods)) = gtk4::accelerator_parse(*default_accel) {
@@ -251,67 +341,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_config_path_xdg() {
-        // Temporarily set XDG_CONFIG_HOME and verify config_path() uses it.
-        std::env::set_var("XDG_CONFIG_HOME", "/tmp/test-xdg-config");
-        let path = config_path();
+    fn test_config_path_from_xdg() {
+        let path = config_path_from(Some("/tmp/test-xdg-config".into()), Some("/home/x".into()));
         assert_eq!(path, PathBuf::from("/tmp/test-xdg-config/cmux/config.toml"));
-        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn test_config_path_from_home_fallback() {
+        let path = config_path_from(None, Some("/home/x".into()));
+        assert_eq!(path, PathBuf::from("/home/x/.config/cmux/config.toml"));
+    }
+
+    /// A unique scratch dir per test, so tests can run in parallel.
+    fn scratch_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("cmux-cfg-{name}-{}", std::process::id()))
+    }
+
+    /// Writes `content` to `<dir>/config.toml` and returns that path.
+    fn write_config(dir: &std::path::Path, content: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, content).unwrap();
+        file
     }
 
     #[test]
     fn test_load_config_missing_file() {
-        // Point to a nonexistent dir so load_config returns defaults silently.
-        std::env::set_var("XDG_CONFIG_HOME", "/tmp/cmux-test-nonexistent-dir-xyz");
-        let config = load_config();
+        // A path that does not exist: load_config_from returns defaults silently.
+        let config = load_config_from(&scratch_dir("missing").join("config.toml"));
         assert!(config.shortcuts.new_workspace.is_none());
         assert!(config.shortcuts.close_workspace.is_none());
-        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
     fn test_load_config_empty_file() {
-        let dir = std::env::temp_dir().join(format!("cmux-cfg-empty-{}", std::process::id()));
-        let cfg_dir = dir.join("cmux");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        let cfg_file = cfg_dir.join("config.toml");
-        std::fs::write(&cfg_file, "").unwrap();
-
-        std::env::set_var("XDG_CONFIG_HOME", dir.to_str().unwrap());
-        let config = load_config();
+        let dir = scratch_dir("empty");
+        let file = write_config(&dir, "");
+        let config = load_config_from(&file);
         assert!(config.shortcuts.new_workspace.is_none());
-        std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_load_config_valid_shortcuts() {
-        let dir = std::env::temp_dir().join(format!("cmux-cfg-valid-{}", std::process::id()));
-        let cfg_dir = dir.join("cmux");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        let cfg_file = cfg_dir.join("config.toml");
-        std::fs::write(&cfg_file, "[shortcuts]\nnew_workspace = \"<Ctrl>t\"\n").unwrap();
-
-        std::env::set_var("XDG_CONFIG_HOME", dir.to_str().unwrap());
-        let config = load_config();
+        let dir = scratch_dir("valid");
+        let file = write_config(&dir, "[shortcuts]\nnew_workspace = \"<Ctrl>t\"\n");
+        let config = load_config_from(&file);
         assert_eq!(config.shortcuts.new_workspace, Some("<Ctrl>t".to_string()));
-        std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_load_config_invalid_toml() {
-        let dir = std::env::temp_dir().join(format!("cmux-cfg-invalid-{}", std::process::id()));
-        let cfg_dir = dir.join("cmux");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        let cfg_file = cfg_dir.join("config.toml");
-        std::fs::write(&cfg_file, "[shortcuts\n").unwrap();
-
-        std::env::set_var("XDG_CONFIG_HOME", dir.to_str().unwrap());
-        let config = load_config();
-        // Falls back to defaults on parse error
+        let dir = scratch_dir("invalid");
+        let file = write_config(&dir, "[shortcuts\n");
+        // Falls back to defaults on a syntax error
+        let config = load_config_from(&file);
         assert!(config.shortcuts.new_workspace.is_none());
-        std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -335,35 +421,70 @@ buttons_right = ["split_right", "toggle_sidebar"]
         assert_eq!(config.ui.header_bar.buttons_right.as_ref().unwrap().len(), 2);
     }
 
-    // Tests that require GTK4 initialization (accelerator_parse).
-    // These will only work in environments with a display (or virtual display).
-
     #[test]
-    fn test_shortcut_map_defaults() {
-        if gtk4::init().is_err() {
-            eprintln!("Skipping test_shortcut_map_defaults: GTK4 init failed (headless)");
-            return;
-        }
-        let smap = ShortcutMap::from_config(&ShortcutConfig::default());
-        // Ctrl+N should map to NewWorkspace
-        let result = smap.lookup(ModifierType::CONTROL_MASK, Key::n);
-        assert_eq!(result, Some(ShortcutAction::NewWorkspace));
+    fn test_session_and_terminal_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.session.restore);
+        assert_eq!(config.terminal.scrollback_bytes, 2_000_000);
     }
 
     #[test]
-    fn test_shortcut_map_custom() {
+    fn test_session_and_terminal_override() {
+        let config = parse_config(
+            "[session]\nrestore = false\n[terminal]\nscrollback_bytes = 500000\n",
+            std::path::Path::new("test"),
+        );
+        assert!(!config.session.restore);
+        assert_eq!(config.terminal.scrollback_bytes, 500_000);
+    }
+
+    #[test]
+    fn test_bad_entry_keeps_other_entries() {
+        let config = parse_config(
+            "[shortcuts]\nnew_workspace = 42\nclose_workspace = \"<Ctrl>w\"\n\
+             [session]\nrestore = \"yes please\"\n\
+             [terminal]\nscrollback_bytes = 1000\n\
+             [ui.header_bar]\nstyle = \"none\"\n",
+            std::path::Path::new("test"),
+        );
+        // The bad shortcut is dropped, the good one is kept.
+        assert!(config.shortcuts.new_workspace.is_none());
+        assert_eq!(config.shortcuts.close_workspace.as_deref(), Some("<Ctrl>w"));
+        // The bad session value falls back to its default; the other sections load.
+        assert!(config.session.restore);
+        assert_eq!(config.terminal.scrollback_bytes, 1000);
+        assert_eq!(config.ui.header_bar.style, "none");
+    }
+
+    #[test]
+    fn test_non_table_section_is_ignored() {
+        let config = parse_config("shortcuts = 3\n[terminal]\nscrollback_bytes = 7\n", std::path::Path::new("test"));
+        assert!(config.shortcuts.new_workspace.is_none());
+        assert_eq!(config.terminal.scrollback_bytes, 7);
+    }
+
+    // Tests that require GTK4 initialization (accelerator_parse).
+    // These will only work in environments with a display (or virtual display).
+
+    // One test, because GTK can only be initialized on one test thread per process.
+    // A second gtk4::init() call from another thread panics.
+    #[test]
+    fn test_shortcut_map() {
         if gtk4::init().is_err() {
-            eprintln!("Skipping test_shortcut_map_custom: GTK4 init failed (headless)");
+            eprintln!("Skipping test_shortcut_map: GTK4 init failed (headless)");
             return;
         }
+        // Defaults: Ctrl+N should map to NewWorkspace
+        let smap = ShortcutMap::from_config(&ShortcutConfig::default());
+        assert_eq!(smap.lookup(ModifierType::CONTROL_MASK, Key::n), Some(ShortcutAction::NewWorkspace));
+
+        // Custom: Ctrl+T maps to NewWorkspace and Ctrl+N no longer does
         let config = ShortcutConfig {
             new_workspace: Some("<Ctrl>t".to_string()),
             ..Default::default()
         };
         let smap = ShortcutMap::from_config(&config);
-        // Ctrl+T should now map to NewWorkspace
         assert_eq!(smap.lookup(ModifierType::CONTROL_MASK, Key::t), Some(ShortcutAction::NewWorkspace));
-        // Ctrl+N should no longer map to NewWorkspace
         assert_eq!(smap.lookup(ModifierType::CONTROL_MASK, Key::n), None);
     }
 }
