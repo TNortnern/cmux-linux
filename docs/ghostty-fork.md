@@ -1,161 +1,47 @@
-# Ghostty Fork Changes (manaflow-ai/ghostty)
+# Ghostty Fork (Linux)
 
-This repo uses a fork of Ghostty for local patches that aren't upstream yet.
-When we change the fork, update this document and the parent submodule SHA.
+cmux-linux builds against a fork of Ghostty: github.com/TNortnern/ghostty, branch `cmux-linux`.
+The `ghostty` submodule (path `ghostty`) is pinned to a commit on that branch.
 
-## Fork update checklist
+## Fork changes
 
-1) Make changes in `ghostty/`.
-2) Commit and push to `manaflow-ai/ghostty`.
-3) Update this file with the new change summary + conflict notes.
-4) In the parent repo: `git add ghostty` and commit the submodule SHA.
+Two commits sit on top of the upstream base:
 
-## Current fork changes
+### 1) GTK4 embedded platform (`c8e38ef8bc`)
 
-Fork rebased onto upstream `v1.3.0` plus newer `main` commits as of March 12, 2026.
+- Adds `GHOSTTY_PLATFORM_GTK4` to the embedded platform API. The host passes a
+  `GtkGLArea` handle (`gl_area`). No `GdkGLContext` is passed.
+- The Rust side makes the GL context current in the GtkGLArea realize handler.
+- Includes the GL realize exports and the Linux render and cursor fixes.
 
-### 1) OSC 99 (kitty) notification parser
+### 2) Vendored deps and libbz2 (`8fda349153`)
 
-- Commit: `a2252e7a9` (Add OSC 99 notification parser)
-- Files:
-  - `src/terminal/osc.zig`
-  - `src/terminal/osc/parsers.zig`
-  - `src/terminal/osc/parsers/kitty_notification.zig`
-- Summary:
-  - Adds a parser for kitty OSC 99 notifications and wires it into the OSC dispatcher.
+- A non-Darwin static libghostty does not include its vendored C/C++ dependencies.
+  The fork installs them next to `libghostty.a` in `zig-out/lib` as
+  `libghostty-dep-0.a` through `libghostty-dep-N.a`, so `build.rs` can link them.
+- With `-fsys=freetype`, libbz2 is linked by its real name, `bz2`
+  (Ubuntu ships no bzip2.pc).
 
-### 2) macOS display link restart on display changes
+## Build
 
-- Commit: `c07e6c5a5` (macos: restart display link after display ID change)
-- Files:
-  - `src/renderer/generic.zig`
-- Summary:
-  - Restarts the CVDisplayLink when `setMacOSDisplayID` updates the current CGDisplay.
-  - Prevents a rare state where vsync is "running" but no callbacks arrive, which can look like a frozen surface until focus/occlusion changes.
+In the submodule:
 
-### 3) Keyboard copy mode selection C API
+```sh
+zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
+```
 
-- Commit: `a50579bd5` (Add C API for keyboard copy mode selection)
-- Files:
-  - `src/Surface.zig`
-  - `src/apprt/embedded.zig`
-- Summary:
-  - Restores `ghostty_surface_select_cursor_cell` and `ghostty_surface_clear_selection`.
-  - Keeps cmux keyboard copy mode working against the refreshed Ghostty base.
+This produces `zig-out/lib/libghostty.a` plus the `libghostty-dep-*.a` archives.
+`build.rs` links them. `scripts/setup-linux.sh` runs this step and checks for the archives.
 
-### 4) macOS resize stale-frame mitigation
+## Bindings
 
-Sections 3 and 4 are grouped by feature, not by commit order. The section 4 resize commits were
-applied earlier than the section 3 copy-mode commit, but they are kept together here because they
-touch the same stale-frame mitigation path and tend to conflict in the same files during rebases.
+Bindings are generated at build time by bindgen from `ghostty/include/ghostty.h`
+(see `build.rs`). The header always matches the library that is linked.
 
-- Commits:
-  - `769bbf7a9` (macos: reduce transient blank/scaled frames during resize)
-  - `9efcdfdf8` (macos: keep top-left gravity for stale-frame replay)
-- Files:
-  - `pkg/macos/animation.zig`
-  - `src/Surface.zig`
-  - `src/apprt/embedded.zig`
-  - `src/renderer/Metal.zig`
-  - `src/renderer/generic.zig`
-  - `src/renderer/metal/IOSurfaceLayer.zig`
-- Summary:
-  - Replays the last rendered frame during resize and keeps its geometry anchored correctly.
-  - Reduces transient blank or scaled frames while a macOS window is being resized.
+## Updating the fork
 
-### 5) zsh prompt redraw markers use OSC 133 P
-
-- Commit: `8ade43ce5` (zsh: use OSC 133 P for prompt redraws)
-- Files:
-  - `src/shell-integration/zsh/ghostty-integration`
-- Summary:
-  - Emits one `OSC 133;A` fresh-prompt mark for real prompt transitions.
-  - Uses `OSC 133;P` markers for prompt redraws so async zsh themes do not look like extra prompt lines.
-
-### 6) zsh Pure-style multiline prompt redraws
-
-- Commits:
-  - `0cf559581` (zsh: fix Pure-style multiline prompt redraws)
-  - `312c7b23a` (zsh: avoid extra Pure continuation markers)
-  - `404a3f175` (Fix Pure prompt redraw markers)
-- Files:
-  - `src/shell-integration/zsh/ghostty-integration`
-- Summary:
-  - Handles multiline prompts that use `\n%{\r%}` to return to column 0 before the visible prompt line.
-  - Keeps redraw-safe prompt-start markers for async themes.
-  - Avoids inserting an explicit continuation marker after Pure's hidden carriage return, because Ghostty already tracks the newline as prompt continuation and the extra marker duplicates the preprompt row.
-  - Restores that prompt-marker behavior on top of the current Ghostty `main` base after the older redraw fix drifted out during later submodule updates.
-
-The fork branch HEAD is now the section 6 zsh redraw follow-up commit.
-
-### 7) cmux theme picker helper hooks
-
-- Commit: `0c52c987b` (Add cmux theme picker helper hooks)
-- Files:
-  - `build.zig`
-  - `src/cli/list_themes.zig`
-  - `src/main_ghostty.zig`
-- Summary:
-  - Adds a `zig build cli-helper` step so cmux can bundle Ghostty's CLI helper binary on macOS.
-  - Lets `+list-themes` switch into a cmux-managed mode via env vars, writing the cmux theme override file and posting the existing cmux reload notification for live app-wide preview.
-  - Fixes the helper-only `app-runtime=none` stdout path so the Ghostty CLI binary builds with the current Zig toolchain.
-
-The fork branch HEAD is now the section 7 cmux theme picker helper commit.
-
-### 8) GHOSTTY_PLATFORM_GTK4 — Linux GTK4 embedded variant
-
-- Files:
-  - `include/ghostty.h` (at repo root: `ghostty.h`)
-  - `src/apprt/embedded.zig`
-  - `src/renderer/OpenGL.zig`
-- Summary:
-  - Adds `GHOSTTY_PLATFORM_GTK4 = 3` to `ghostty_platform_e` enum in ghostty.h.
-  - Adds `ghostty_platform_gtk4_s` struct (single `void* gl_area` field) and `gtk4` member to `ghostty_platform_u` union.
-  - Adds `gtk4 = 3` to `PlatformTag` enum in embedded.zig.
-  - Adds `GTK4` type (linux-only, `gl_area: *anyopaque`) and `gtk4` arm to the `Platform` union.
-  - Adds `gtk4` member to `Platform.C` extern union and `gtk4` arm to `Platform.init()`.
-  - Replaces the "strictly broken" TODO stub in `OpenGL.zig surfaceInit` with a GTK4 dispatch: calls `prepareContext(null)` when the embedded surface's platform is GTK4 (same path as the GTK apprt).
-  - Adds no-op GTK4 arms in `threadEnter` and `threadExit` (GtkGLArea manages context lifecycle on the Rust side).
-- Design notes:
-  - `void* gl_area` avoids requiring GTK4 headers in ghostty.h — consistent with `void* nsview` (macOS) pattern.
-  - `GdkGLContext` is NOT passed; GTK4 manages it internally via `GtkGLArea`. Rust side calls `gl_area.make_current()` in the realize signal handler.
-  - `wakeup_cb` and `userdata` are registered globally via `ghostty_runtime_config_s`, not per-surface.
-  - `GTK4` type is `void` on non-Linux targets so the type compiles cross-platform.
-
-## Upstreamed fork changes
-
-### cursor-click-to-move respects OSC 133 click-to-move
-
-- Was local in the fork as `10a585754`.
-- Landed upstream as `bb646926f`, so it is no longer carried as a fork-only patch.
-
-## Merge conflict notes
-
-These files change frequently upstream; be careful when rebasing the fork:
-
-- `src/terminal/osc/parsers.zig`
-  - Upstream uses `std.testing.refAllDecls(@This())` in `test {}`.
-  - Ensure `iterm2` import stays, and keep `kitty_notification` import added by us.
-
-- `src/terminal/osc.zig`
-  - OSC dispatch logic moves often. Re-check the integration points for the OSC 99 parser.
-
-- `src/shell-integration/zsh/ghostty-integration`
-  - Prompt marker handling is easy to regress when upstream adjusts zsh redraw behavior. Keep the
-    `OSC 133;A` vs `OSC 133;P` split intact for redraw-heavy themes. Pure-style `\n%{\r%}`
-    prompt newlines should not get an extra explicit continuation marker after the hidden CR.
-
-- `src/cli/list_themes.zig`
-  - cmux now relies on the upstream picker UI plus local env-driven hooks for live preview and restore.
-    If upstream reorganizes the preview loop or key handling, re-check the cmux mode path and keep the
-    stock Ghostty behavior unchanged when the cmux env vars are absent.
-
-- `src/apprt/embedded.zig` (Platform/PlatformTag)
-  - `ghostty_platform_e` enum will conflict if upstream adds new platform values at position 3.
-  - `Platform` union and `PlatformTag` enum conflict on any change to these types.
-
-- `src/renderer/OpenGL.zig` (surfaceInit/threadEnter/threadExit)
-  - The embedded arm switch blocks are conflict-prone during upstream renderer updates.
-  - Re-check GTK4 dispatch if upstream changes the apprt.embedded arm structure.
-
-If you resolve a conflict, update this doc with what changed.
+1. Commit the change to the `cmux-linux` branch of TNortnern/ghostty and push it.
+2. In this repo, rebuild the submodule with the command above.
+3. Confirm `build.rs` still finds every `libghostty-dep-*.a` archive. It panics
+   if none are present, which usually means the submodule is not the fork.
+4. `git add ghostty` and commit the new submodule SHA.

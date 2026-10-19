@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
+# validate-all.sh -- static checks on the desktop metadata, icons and completions
+# (no package needed). Usage: validate-all.sh
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
+APP_ID="com.cmux_lx.terminal"
+DESKTOP="$REPO_ROOT/packaging/desktop/$APP_ID.desktop"
+METAINFO="$REPO_ROOT/packaging/desktop/$APP_ID.metainfo.xml"
+
 PASS=0
 FAIL=0
 
@@ -16,34 +23,35 @@ check() {
     fi
 }
 
-# META-01: Reverse-DNS ID consistency
-check "META-01: .desktop has correct ID" \
-    grep -q 'Icon=com.cmux_lx.terminal' "$REPO_ROOT/packaging/desktop/com.cmux_lx.terminal.desktop"
-check "META-01: metainfo has correct ID" \
-    grep -q '<id>com.cmux_lx.terminal</id>' "$REPO_ROOT/packaging/desktop/com.cmux_lx.terminal.metainfo.xml"
+check "desktop entry id matches app id" grep -q "^Icon=$APP_ID\$" "$DESKTOP"
+check "metainfo id matches app id" grep -q "<id>$APP_ID</id>" "$METAINFO"
+check "metainfo license is AGPL-3.0-or-later" grep -q "<project_license>AGPL-3.0-or-later</project_license>" "$METAINFO"
 
-# META-02: AppStream metainfo validates
-check "META-02: appstreamcli validate" \
-    appstreamcli validate --no-net "$REPO_ROOT/packaging/desktop/com.cmux_lx.terminal.metainfo.xml"
+if command -v desktop-file-validate >/dev/null; then
+    check "desktop-file-validate" desktop-file-validate "$DESKTOP"
+else
+    echo "SKIP: desktop-file-validate (install desktop-file-utils)"
+fi
+if command -v appstreamcli >/dev/null; then
+    check "appstreamcli validate" appstreamcli validate --no-net "$METAINFO"
+else
+    echo "SKIP: appstreamcli (install appstream)"
+fi
 
-# META-03: Icons exist at correct sizes
-for SIZE in 48 128 256; do
-    check "META-03: ${SIZE}px icon exists" \
-        test -f "$REPO_ROOT/packaging/icons/hicolor/${SIZE}x${SIZE}/apps/com.cmux_lx.terminal.png"
+for size in 48 128 256; do
+    check "${size}px icon exists" test -f "$REPO_ROOT/packaging/icons/hicolor/${size}x${size}/apps/$APP_ID.png"
 done
+check "scalable icon exists" test -f "$REPO_ROOT/resources/cmux.svg"
 
-# META-04: Shell completions exist
-check "META-04: bash completion" test -f "$REPO_ROOT/packaging/completions/cmux.bash"
-check "META-04: zsh completion" test -f "$REPO_ROOT/packaging/completions/_cmux"
-check "META-04: fish completion" test -f "$REPO_ROOT/packaging/completions/cmux.fish"
-
-# META-05: Man page exists and renders
-check "META-05: man page exists" test -f "$REPO_ROOT/packaging/man/cmux.1"
-check "META-05: man page renders" man -l "$REPO_ROOT/packaging/man/cmux.1"
-
-# BUILD-02: Dependency detection script exists and is executable
-check "BUILD-02: detect-deps.sh exists" test -x "$REPO_ROOT/packaging/scripts/detect-deps.sh"
+check "bash completion exists" test -f "$REPO_ROOT/packaging/completions/cmux.bash"
+check "zsh completion exists" test -f "$REPO_ROOT/packaging/completions/_cmux"
+check "fish completion exists" test -f "$REPO_ROOT/packaging/completions/cmux.fish"
+check "man page exists" test -f "$REPO_ROOT/packaging/man/cmux.1"
+if command -v man >/dev/null; then
+    check "man page renders" man -l "$REPO_ROOT/packaging/man/cmux.1"
+fi
+check "detect-deps.sh is executable" test -x "$PACKAGING_SCRIPTS_DIR/detect-deps.sh"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
-[ "$FAIL" -eq 0 ]
+[[ "$FAIL" -eq 0 ]]

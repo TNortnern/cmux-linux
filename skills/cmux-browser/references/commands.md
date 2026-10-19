@@ -92,7 +92,7 @@ cmux browser <surface> download wait --timeout-ms 10000
 - Prefer short handles in outputs by default (`surface:N`, `pane:N`, `workspace:N`, `window:N`).
 - Use `--id-format both` only when a UUID must be logged/exported.
 
-## Known WKWebView Gaps (`not_supported`)
+## Known Gaps (`not_supported`)
 
 - `browser.viewport.set`
 - `browser.geolocation.set`

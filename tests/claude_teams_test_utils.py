@@ -18,5 +18,5 @@ def resolve_cmux_cli() -> str:
             return candidate
 
     raise RuntimeError(
-        "Unable to find cmux CLI binary. Set CMUX_CLI_BIN or run ./scripts/reload.sh --tag <tag> first."
+        "Unable to find cmux CLI binary. Set CMUX_CLI_BIN to its path."
     )

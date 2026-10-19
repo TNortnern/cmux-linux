@@ -1,29 +1,23 @@
 # Notifications
 
-cmux provides a notification panel for AI agents like Claude Code, Codex, and OpenCode. Notifications appear in a dedicated panel and trigger macOS system notifications.
+cmux provides a notification panel for AI agents like Claude Code, Codex, and OpenCode. Notifications appear in a dedicated panel and trigger desktop notifications (via `notify-send`).
 
 ## Quick Start
 
 ```bash
 # Send a notification (if cmux is available)
 command -v cmux &>/dev/null && cmux notify --title "Done" --body "Task complete"
-
-# With fallback to macOS notifications
-command -v cmux &>/dev/null && cmux notify --title "Done" --body "Task complete" || osascript -e 'display notification "Task complete" with title "Done"'
 ```
 
 ## Detection
 
-Check if `cmux` CLI is available before using it:
+Check if the `cmux` CLI is available before using it:
 
 ```bash
 # Shell
 if command -v cmux &>/dev/null; then
     cmux notify --title "Hello"
 fi
-
-# One-liner with fallback
-command -v cmux &>/dev/null && cmux notify --title "Hello" || osascript -e 'display notification "" with title "Hello"'
 ```
 
 ```python
@@ -34,9 +28,6 @@ import subprocess
 def notify(title: str, body: str = ""):
     if shutil.which("cmux"):
         subprocess.run(["cmux", "notify", "--title", title, "--body", body])
-    else:
-        # Fallback to macOS
-        subprocess.run(["osascript", "-e", f'display notification "{body}" with title "{title}"'])
 ```
 
 ## CLI Usage
@@ -67,7 +58,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "command -v cmux &>/dev/null && cmux notify --title 'Claude Code' --body 'Waiting for input' || osascript -e 'display notification \"Waiting for input\" with title \"Claude Code\"'"
+            "command": "command -v cmux &>/dev/null && cmux notify --title 'Claude Code' --body 'Waiting for input'"
           }
         ]
       },
@@ -76,7 +67,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "command -v cmux &>/dev/null && cmux notify --title 'Claude Code' --subtitle 'Permission' --body 'Approval needed' || osascript -e 'display notification \"Approval needed\" with title \"Claude Code\"'"
+            "command": "command -v cmux &>/dev/null && cmux notify --title 'Claude Code' --subtitle 'Permission' --body 'Approval needed'"
           }
         ]
       }
@@ -90,7 +81,7 @@ Add to `~/.claude/settings.json`:
 Add to `~/.codex/config.toml`:
 
 ```toml
-notify = ["bash", "-c", "command -v cmux &>/dev/null && cmux notify --title Codex --body \"$(echo $1 | jq -r '.\"last-assistant-message\" // \"Turn complete\"' 2>/dev/null | head -c 100)\" || osascript -e 'display notification \"Turn complete\" with title \"Codex\"'", "--"]
+notify = ["bash", "-c", "command -v cmux &>/dev/null && cmux notify --title Codex --body \"$(echo $1 | jq -r '.\"last-assistant-message\" // \"Turn complete\"' 2>/dev/null | head -c 100)\"", "--"]
 ```
 
 Or create a simple script `~/.local/bin/codex-notify.sh`:
@@ -98,7 +89,7 @@ Or create a simple script `~/.local/bin/codex-notify.sh`:
 ```bash
 #!/bin/bash
 MSG=$(echo "$1" | jq -r '."last-assistant-message" // "Turn complete"' 2>/dev/null | head -c 100)
-command -v cmux &>/dev/null && cmux notify --title "Codex" --body "$MSG" || osascript -e "display notification \"$MSG\" with title \"Codex\""
+command -v cmux &>/dev/null && cmux notify --title "Codex" --body "$MSG"
 ```
 
 Then use:
@@ -116,7 +107,7 @@ export const CmuxNotificationPlugin = async ({ $, }) => {
     try {
       await $`command -v cmux && cmux notify --title ${title} --body ${body}`;
     } catch {
-      await $`osascript -e ${"display notification \"" + body + "\" with title \"" + title + "\""}`;
+      // cmux is not installed or not running
     }
   };
 
@@ -132,25 +123,20 @@ export const CmuxNotificationPlugin = async ({ $, }) => {
 
 ## Environment Variables
 
-cmux sets these in child shells:
-
 | Variable | Description |
 |----------|-------------|
-| `CMUX_SOCKET_PATH` | Path to control socket |
-| `CMUX_TAB_ID` | UUID of the current tab |
-| `CMUX_PANEL_ID` | UUID of the current panel |
+| `CMUX_SOCKET` | Overrides the control socket path. Default: `$XDG_RUNTIME_DIR/cmux/cmux.sock` (falls back to `/run/user/$UID/cmux/cmux.sock`) |
 
 ## CLI Commands
 
 ```
 cmux notify --title <text> [--subtitle <text>] [--body <text>] [--tab <id|index>] [--panel <id|index>]
 cmux list-notifications
-cmux clear-notifications
+cmux clear-notification <id>
 cmux ping
 ```
 
 ## Best Practices
 
 1. **Always check availability first** - Use `command -v cmux` before calling
-2. **Provide fallbacks** - Use `|| osascript` for macOS fallback
-3. **Keep notifications concise** - Title should be brief, use body for details
+2. **Keep notifications concise** - Title should be brief, use body for details
