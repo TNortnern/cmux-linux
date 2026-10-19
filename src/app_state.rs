@@ -109,6 +109,7 @@ impl AppState {
             None,
             pane_id,
             crate::ghostty::surface::SurfaceIoMode::Exec,
+            None,
         );
         let engine = SplitEngine::new(self.gtk_app.clone(), self.ghostty_app, pane, pane_id);
 
@@ -241,6 +242,7 @@ impl AppState {
             None,
             pane_id,
             crate::ghostty::surface::SurfaceIoMode::Manual { io_write_ctx: io_ctx.clone() },
+            None,
         );
         let engine = SplitEngine::new(self.gtk_app.clone(), self.ghostty_app, pane, pane_id);
 

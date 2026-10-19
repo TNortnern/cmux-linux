@@ -110,6 +110,9 @@ pub fn create_surface(
     inherited_config: Option<ffi::ghostty_surface_config_s>,
     pane_id: u64,
     io_mode: SurfaceIoMode,
+    // Start the shell in this folder (new tab/split in the current folder, session restore).
+    // STUB: ignored until package T2 wires it into ghostty's working_directory.
+    _cwd: Option<std::path::PathBuf>,
 ) -> PaneSurface {
     use gtk4::prelude::*;
 

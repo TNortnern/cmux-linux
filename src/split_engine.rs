@@ -376,6 +376,7 @@ impl SplitEngine {
                     None,
                     pane_id,
                     crate::ghostty::surface::SurfaceIoMode::Exec,
+                    None,
                 );
                 // Phase 9: Attach right-click context menu (D-08)
                 attach_terminal_context_menu(&pane.gl_area);
@@ -439,6 +440,12 @@ impl SplitEngine {
     pub fn sync_surfaces_from_registry(&mut self) {}
 
     /// Returns the root widget of this workspace's split tree.
+    /// Current working directory of the focused pane, as last reported by its shell.
+    /// STUB: package T2 implements (ghostty PWD action / OSC 7).
+    pub fn focused_cwd(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     pub fn root_widget(&self) -> gtk4::Widget {
         self.root.widget()
     }
@@ -544,6 +551,7 @@ impl SplitEngine {
             Some(inherited_config),
             new_pane_id,
             crate::ghostty::surface::SurfaceIoMode::Exec,
+            None,
         );
         // Phase 9: Attach right-click context menu (D-08)
         attach_terminal_context_menu(&pane.gl_area);
