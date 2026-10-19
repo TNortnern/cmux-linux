@@ -27,7 +27,10 @@ pub fn parse_ssh_config_hosts(content: &str) -> Vec<String> {
             .or_else(|| trimmed.strip_prefix("Host\t"))
         {
             for host in rest.split_whitespace() {
-                if !host.contains('*') && !host.contains('?') {
+                // Aliases become ssh arguments, so unsafe names are dropped here.
+                if !host.contains('*') && !host.contains('?')
+                    && crate::ssh::target::validate_target(host).is_ok()
+                {
                     hosts.push(host.to_string());
                 }
             }
@@ -57,6 +60,10 @@ pub fn load_saved_hosts() -> SshHostsFile {
 
 /// Save a host target to ssh_hosts.toml. Skips duplicates. Logs errors to stderr.
 pub fn save_host(target: &str) {
+    if let Err(e) = crate::ssh::target::validate_target(target) {
+        eprintln!("cmux: not saving invalid SSH target: {e}");
+        return;
+    }
     let mut file = load_saved_hosts();
     if file.hosts.iter().any(|h| h == target) {
         return; // Already saved
@@ -92,7 +99,12 @@ pub fn save_host(target: &str) {
 
 /// Merge saved hosts and SSH config hosts, deduplicate, return sorted.
 pub fn all_hosts() -> Vec<String> {
-    let mut hosts = load_saved_hosts().hosts;
+    // Saved entries are hand-editable TOML, so they get the same validation as new input.
+    let mut hosts: Vec<String> = load_saved_hosts()
+        .hosts
+        .into_iter()
+        .filter(|h| crate::ssh::target::validate_target(h).is_ok())
+        .collect();
     for h in load_ssh_config_hosts() {
         if !hosts.contains(&h) {
             hosts.push(h);
@@ -145,6 +157,12 @@ mod tests {
     fn test_parse_hostname_ignored() {
         let input = "HostName not-a-host\nHost real\n";
         assert_eq!(parse_ssh_config_hosts(input), vec!["real"]);
+    }
+
+    #[test]
+    fn test_parse_unsafe_alias_filtered() {
+        let input = "Host -oProxyCommand=evil good\n";
+        assert_eq!(parse_ssh_config_hosts(input), vec!["good"]);
     }
 
     #[test]

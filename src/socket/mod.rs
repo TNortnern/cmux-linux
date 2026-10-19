@@ -1,9 +1,16 @@
 pub mod auth;
 pub mod commands;
 pub mod handlers;
+pub mod validate;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+/// Largest accepted request line. Longer requests get an error and the connection is dropped.
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Maximum concurrent client connections. Extra connections are closed immediately.
+const MAX_CONNECTIONS: usize = 64;
 
 /// Compute the Unix socket path per D-06.
 /// $XDG_RUNTIME_DIR/cmux/cmux.sock, fallback /run/user/{uid}/cmux/cmux.sock.
@@ -76,16 +83,25 @@ pub fn start_socket_server(
     eprintln!("cmux: socket server listening at {}", sock_path.display());
 
     // Spawn the accept loop in tokio.
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     runtime.spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
                     // Validate peer UID before reading any data.
                     match auth::validate_peer_uid(&stream) {
-                        Ok(true) => {
-                            let tx = cmd_tx.clone();
-                            tokio::spawn(handle_connection(stream, tx));
-                        }
+                        Ok(true) => match limit.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                let tx = cmd_tx.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit; // released when the connection ends
+                                    handle_connection(stream, tx).await;
+                                });
+                            }
+                            Err(_) => {
+                                eprintln!("cmux: socket connection limit reached, rejecting");
+                            }
+                        },
                         Ok(false) => {
                             eprintln!("cmux: socket connection rejected (UID mismatch)");
                         }
@@ -95,12 +111,51 @@ pub fn start_socket_server(
                     }
                 }
                 Err(e) => {
+                    // Transient (e.g. EMFILE): log, back off briefly, keep serving.
                     eprintln!("cmux: socket accept error: {e}");
-                    break;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }
     });
+}
+
+/// One request line read by `read_capped_line`.
+#[derive(Debug, PartialEq)]
+enum LineRead {
+    Line(Vec<u8>),
+    Eof,
+    TooLong,
+}
+
+/// Read one newline-terminated line, buffering at most `max` bytes of it.
+/// A line that would exceed `max` returns `TooLong` without reading further.
+async fn read_capped_line<R>(reader: &mut R, max: usize) -> std::io::Result<LineRead>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() { LineRead::Eof } else { LineRead::Line(buf) });
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let take = newline.unwrap_or(available.len());
+        if buf.len() + take > max {
+            return Ok(LineRead::TooLong);
+        }
+        buf.extend_from_slice(&available[..take]);
+        match newline {
+            Some(_) => {
+                reader.consume(take + 1);
+                return Ok(LineRead::Line(buf));
+            }
+            None => reader.consume(take),
+        }
+    }
 }
 
 /// Per-connection handler running in a tokio task.
@@ -109,13 +164,32 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<commands::SocketCommand>,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let response = dispatch_line(&line, &cmd_tx).await;
+    loop {
+        let bytes = match read_capped_line(&mut reader, MAX_REQUEST_BYTES).await {
+            Ok(LineRead::Line(bytes)) => bytes,
+            Ok(LineRead::Eof) | Err(_) => break,
+            Ok(LineRead::TooLong) => {
+                let response = serde_json::json!({
+                    "id": null,
+                    "ok": false,
+                    "error": {
+                        "code": "request_too_large",
+                        "message": format!("request exceeds {MAX_REQUEST_BYTES} bytes"),
+                    }
+                })
+                .to_string();
+                let _ = writer.write_all(response.as_bytes()).await;
+                let _ = writer.write_all(b"\n").await;
+                break;
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let response = dispatch_line(text.trim_end_matches('\r'), &cmd_tx).await;
         if writer.write_all(response.as_bytes()).await.is_err() { break; }
         if writer.write_all(b"\n").await.is_err() { break; }
     }
@@ -239,6 +313,8 @@ async fn dispatch_line(
         "window.current" => commands::SocketCommand::WindowCurrent { req_id: req_id.clone(), resp_tx },
 
         "debug.layout" => commands::SocketCommand::DebugLayout { req_id: req_id.clone(), resp_tx },
+        // Keystroke injection is a debugging aid only; release builds do not route it.
+        #[cfg(debug_assertions)]
         "debug.type" => commands::SocketCommand::DebugType {
             req_id: req_id.clone(),
             text: params.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -319,6 +395,27 @@ mod tests {
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/tmp/test-xdg") };
         let path = socket_path();
         assert_eq!(path, std::path::PathBuf::from("/tmp/test-xdg/cmux/cmux.sock"));
+    }
+
+    #[tokio::test]
+    async fn test_read_capped_line_reads_lines() {
+        let data: &[u8] = b"abc\ndef";
+        let mut reader = tokio::io::BufReader::new(data);
+        assert_eq!(read_capped_line(&mut reader, 16).await.unwrap(), LineRead::Line(b"abc".to_vec()));
+        // Final line without a trailing newline is still returned.
+        assert_eq!(read_capped_line(&mut reader, 16).await.unwrap(), LineRead::Line(b"def".to_vec()));
+        assert_eq!(read_capped_line(&mut reader, 16).await.unwrap(), LineRead::Eof);
+    }
+
+    #[tokio::test]
+    async fn test_read_capped_line_rejects_overlong() {
+        let data: &[u8] = b"abcdefgh\nok\n";
+        let mut reader = tokio::io::BufReader::new(data);
+        assert_eq!(read_capped_line(&mut reader, 4).await.unwrap(), LineRead::TooLong);
+        // A line exactly at the cap is accepted.
+        let data: &[u8] = b"abcd\n";
+        let mut reader = tokio::io::BufReader::new(data);
+        assert_eq!(read_capped_line(&mut reader, 4).await.unwrap(), LineRead::Line(b"abcd".to_vec()));
     }
 
     /// SOCK-05: Focus policy whitelist is documented.

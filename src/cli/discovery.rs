@@ -1,16 +1,16 @@
 //! Socket path discovery chain for the cmux CLI.
 //!
 //! Ports the Python `_default_socket_path()` logic from tests_v2/cmux.py to Rust.
-//! Discovery order matches D-11.
+//! Discovery order matches D-11, minus the world-writable /tmp fallbacks: another
+//! local user could plant a socket there and receive our commands.
 
-use std::path::Path;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 /// Discover the cmux socket path using the standard search chain.
 ///
 /// Returns `Some(path)` if a candidate is found, `None` otherwise.
-/// The caller should check whether the path actually exists if needed;
-/// this function returns the best candidate even if the socket file
-/// is not yet present (for env-var overrides and fallback paths).
+/// Explicit overrides (CMUX_SOCKET, CMUX_SOCKET_PATH, --socket) are returned as given.
+/// Discovered paths must pass `is_trusted_socket` (own socket, not a symlink).
 pub fn discover_socket() -> Option<String> {
     // 1. CMUX_SOCKET env var
     if let Ok(val) = std::env::var("CMUX_SOCKET") {
@@ -31,7 +31,7 @@ pub fn discover_socket() -> Option<String> {
         format!("/run/user/{}", unsafe { libc::getuid() })
     });
     let xdg_socket = format!("{}/cmux/cmux.sock", xdg_base);
-    if Path::new(&xdg_socket).exists() {
+    if trusted_socket_path(&xdg_socket) {
         return Some(xdg_socket);
     }
 
@@ -39,35 +39,58 @@ pub fn discover_socket() -> Option<String> {
     let marker = format!("{}/cmux/last-socket-path", xdg_base);
     if let Ok(contents) = std::fs::read_to_string(&marker) {
         let path = contents.trim().to_string();
-        if !path.is_empty() && Path::new(&path).exists() {
+        if !path.is_empty() && trusted_socket_path(&path) {
             return Some(path);
         }
     }
 
-    // 4. /tmp/cmux-debug.sock
-    let debug_sock = "/tmp/cmux-debug.sock";
-    if Path::new(debug_sock).exists() {
-        return Some(debug_sock.to_string());
-    }
-
-    // 5. Glob /tmp/cmux-debug-*.sock — sort by mtime descending, return newest
-    if let Ok(entries) = std::fs::read_dir("/tmp") {
-        let mut candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with("cmux-debug-") && name_str.ends_with(".sock") {
-                if let Ok(meta) = entry.metadata() {
-                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    candidates.push((entry.path().to_string_lossy().to_string(), mtime));
-                }
-            }
-        }
-        if !candidates.is_empty() {
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
-            return Some(candidates[0].0.clone());
-        }
-    }
-
     None
+}
+
+/// Pure ownership rule for a discovered socket, from its lstat fields.
+/// Must be a socket (not a regular file or directory), not a symlink, owned by `expected_uid`.
+pub fn is_trusted_socket(is_socket: bool, is_symlink: bool, owner_uid: u32, expected_uid: u32) -> bool {
+    is_socket && !is_symlink && owner_uid == expected_uid
+}
+
+/// lstat `path` (no symlink following) and apply `is_trusted_socket` for our own UID.
+fn trusted_socket_path(path: &str) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            is_trusted_socket(
+                file_type.is_socket(),
+                file_type.is_symlink(),
+                meta.uid(),
+                unsafe { libc::getuid() },
+            )
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_socket_is_trusted() {
+        assert!(is_trusted_socket(true, false, 1000, 1000));
+    }
+
+    #[test]
+    fn foreign_owner_is_rejected() {
+        assert!(!is_trusted_socket(true, false, 1001, 1000));
+        assert!(!is_trusted_socket(true, false, 0, 1000));
+    }
+
+    #[test]
+    fn symlink_is_rejected() {
+        assert!(!is_trusted_socket(true, true, 1000, 1000));
+    }
+
+    #[test]
+    fn non_socket_is_rejected() {
+        assert!(!is_trusted_socket(false, false, 1000, 1000));
+    }
 }

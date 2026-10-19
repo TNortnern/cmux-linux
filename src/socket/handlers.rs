@@ -59,7 +59,8 @@ pub fn handle_socket_command(
         }
 
         SocketCommand::Capabilities { req_id, resp_tx } => {
-            let methods: Vec<&str> = vec![
+            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+            let mut methods: Vec<&str> = vec![
                 "system.ping", "system.identify", "system.capabilities",
                 "workspace.list", "workspace.current", "workspace.create",
                 "workspace.select", "workspace.close", "workspace.rename",
@@ -104,8 +105,10 @@ pub fn handle_socket_command(
                 "browser.highlight",
                 "browser.state.save", "browser.state.load",
                 // Debug
-                "debug.layout", "debug.type",
+                "debug.layout",
             ];
+            #[cfg(debug_assertions)]
+            methods.push("debug.type");
             let _ = resp_tx.send(ok(req_id, json!({"methods": methods})));
         }
 
@@ -141,6 +144,12 @@ pub fn handle_socket_command(
         }
 
         SocketCommand::WorkspaceCreate { req_id, remote_target, resp_tx } => {
+            if let Some(ref target) = remote_target {
+                if let Err(e) = crate::ssh::target::validate_target(target) {
+                    let _ = resp_tx.send(err(req_id, "invalid_params", &e));
+                    return;
+                }
+            }
             if let Some(target) = remote_target {
                 // SSH workspace creation per D-13, D-15
                 // Create per-workspace bridge for SSH I/O routing
@@ -317,6 +326,7 @@ pub fn handle_socket_command(
             }
         }
 
+        #[cfg(debug_assertions)]
         SocketCommand::DebugType { req_id, text, resp_tx } => {
             // SOCK-05: No focus side effects (sends text to active surface without changing focus).
             let s = state.borrow();
@@ -634,6 +644,13 @@ pub fn handle_socket_command(
         // -- browser.* (Phase 8: D-04 lifecycle + streaming) --
         // SOCK-05: None of these commands steal focus.
         SocketCommand::BrowserOpen { req_id, url, workspace, resp_tx } => {
+            let url = match crate::socket::validate::normalize_browser_url(&url) {
+                Ok(url) => url,
+                Err(e) => {
+                    let _ = resp_tx.send(err(req_id, "invalid_url", &e));
+                    return;
+                }
+            };
             let mut s = state.borrow_mut();
             // Lazy-init BrowserManager per D-05
             if s.browser_manager.is_none() {
@@ -814,6 +831,22 @@ pub fn handle_socket_command(
                     "stream.disable" => "stream_disable",
                     _ => &action,
                 };
+                // Navigation takes the same URL rules as browser.open (scheme allowlist).
+                if matches!(daemon_action, "navigate" | "launch") {
+                    if let Some(raw) = params.get("url").and_then(|v| v.as_str()).map(String::from) {
+                        match crate::socket::validate::normalize_browser_url(&raw) {
+                            Ok(url) => {
+                                if let Some(obj) = params.as_object_mut() {
+                                    obj.insert("url".to_string(), json!(url));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = resp_tx.send(err(req_id, "invalid_url", &e));
+                                return;
+                            }
+                        }
+                    }
+                }
                 match bm.send_command(daemon_action, params) {
                     Ok(result) => {
                         let _ = resp_tx.send(ok(req_id, result));

@@ -52,10 +52,16 @@ pub fn show_ssh_dialog(app: &gtk4::Application, state: Rc<RefCell<AppState>>) {
         let dialog = dialog.clone();
         move |e| {
             let target = e.text().to_string().trim().to_string();
-            if !target.is_empty() {
-                trigger_ssh_connect(&state, target);
-                dialog.close();
+            if target.is_empty() {
+                return;
             }
+            // Reject unsafe targets here; the dialog stays open so the user can fix the text.
+            if let Err(msg) = crate::ssh::target::validate_target(&target) {
+                eprintln!("cmux: invalid SSH target: {msg}");
+                return;
+            }
+            trigger_ssh_connect(&state, target);
+            dialog.close();
         }
     });
 

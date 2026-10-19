@@ -39,22 +39,23 @@ impl BrowserManager {
         }
     }
 
-    /// Mirrors agent-browser/cli/src/connection.rs socket dir discovery.
+    /// Directory for the daemon's socket and stream-port files. Never /tmp, where
+    /// another local user could pre-create or replace files.
+    /// Order: $AGENT_BROWSER_SOCKET_DIR, $XDG_RUNTIME_DIR/cmux/agent-browser,
+    /// ~/.cache/cmux/agent-browser. The chosen dir is passed to the daemon via
+    /// AGENT_BROWSER_SOCKET_DIR so both sides agree.
     fn agent_browser_socket_dir() -> PathBuf {
-        if let Ok(dir) = std::env::var("AGENT_BROWSER_SOCKET_DIR") {
-            if !dir.is_empty() {
-                return PathBuf::from(dir);
-            }
+        let non_empty = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        if let Some(dir) = non_empty("AGENT_BROWSER_SOCKET_DIR") {
+            return PathBuf::from(dir);
         }
-        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-            if !dir.is_empty() {
-                return PathBuf::from(dir).join("agent-browser");
-            }
+        if let Some(dir) = non_empty("XDG_RUNTIME_DIR") {
+            return PathBuf::from(dir).join("cmux").join("agent-browser");
         }
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".agent-browser");
+        if let Some(home) = non_empty("HOME") {
+            return PathBuf::from(home).join(".cache").join("cmux").join("agent-browser");
         }
-        std::env::temp_dir().join("agent-browser")
+        PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })).join("cmux").join("agent-browser")
     }
 
     pub fn daemon_socket_path(&self) -> PathBuf {
@@ -65,56 +66,72 @@ impl BrowserManager {
         Self::agent_browser_socket_dir().join(format!("{}.stream", self.session_name))
     }
 
+    /// The daemon socket exists, is a socket, and belongs to us.
     fn daemon_ready(&self) -> bool {
-        std::os::unix::net::UnixStream::connect(self.daemon_socket_path()).is_ok()
+        socket_is_ours(&self.daemon_socket_path())
+            && std::os::unix::net::UnixStream::connect(self.daemon_socket_path()).is_ok()
     }
 
     /// Auto-start the agent-browser daemon (D-05).
+    ///
+    /// Runs on the GTK thread, on first browser use only: it blocks for up to 5s
+    /// while polling (every 100ms) for the daemon socket. Later calls return at once.
     pub fn ensure_daemon(&mut self) -> Result<(), String> {
         if self.daemon_ready() {
             return Ok(());
         }
 
-        // Find agent-browser binary: check PATH, then alongside cmux binary.
+        // Find agent-browser binary: packaged install, then PATH, then alongside cmux binary.
         let binary_path = which_agent_browser().ok_or_else(|| {
-            "agent-browser not found in PATH. Install it or place it alongside the cmux binary."
-                .to_string()
+            "agent-browser not found. Install it to /usr/lib/cmux or place it on PATH.".to_string()
         })?;
 
-        // Create socket dir if needed.
+        // Private socket dir (0700, owned by us) before the daemon writes into it.
         let socket_dir = Self::agent_browser_socket_dir();
-        std::fs::create_dir_all(&socket_dir)
-            .map_err(|e| format!("Failed to create socket dir {}: {}", socket_dir.display(), e))?;
+        ensure_private_dir(&socket_dir)?;
 
         let child = Command::new(&binary_path)
             .env("AGENT_BROWSER_DAEMON", "1")
             .env("AGENT_BROWSER_SESSION", &self.session_name)
             .env("AGENT_BROWSER_STREAM_PORT", "0")
+            .env("AGENT_BROWSER_SOCKET_DIR", &socket_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            // Nothing drains stderr, so a piped stream would eventually block the daemon.
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("Failed to spawn agent-browser: {}", e))?;
 
         self.daemon_process = Some(child);
 
-        // Poll daemon_ready() with 200ms intervals, up to 50 retries (10s).
+        // Poll daemon_ready() every 100ms, for at most 5s in total.
         for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             if self.daemon_ready() {
                 self.preview_state = PreviewState::Connected;
                 return Ok(());
             }
         }
 
-        Err("agent-browser daemon failed to start within 10 seconds".to_string())
+        Err("agent-browser daemon failed to start within 5 seconds".to_string())
     }
 
     /// Send a newline-delimited JSON command to the daemon socket.
+    /// Blocking, with 5s read and write timeouts so a stuck daemon cannot freeze the GTK thread.
     pub fn send_command(&self, action: &str, params: Value) -> Result<Value, String> {
         let socket_path = self.daemon_socket_path();
+        if !socket_is_ours(&socket_path) {
+            return Err("agent-browser daemon socket is missing or not owned by you".to_string());
+        }
         let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
             .map_err(|e| format!("Failed to connect to daemon socket: {}", e))?;
+        let timeout = Some(std::time::Duration::from_secs(5));
+        stream
+            .set_read_timeout(timeout)
+            .map_err(|e| format!("Failed to set read timeout: {}", e))?;
+        stream
+            .set_write_timeout(timeout)
+            .map_err(|e| format!("Failed to set write timeout: {}", e))?;
 
         let req_id = format!("cmux-{}", rand_u64());
         let mut request = if let Value::Object(map) = params {
@@ -434,7 +451,11 @@ pub fn spawn_motion_forwarder(
             let path = daemon_socket_path.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 use std::io::Write;
+                if !socket_is_ours(&path) {
+                    return;
+                }
                 if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
                     let req = serde_json::json!({
                         "id": "motion",
                         "action": "input_mouse",
@@ -452,9 +473,15 @@ pub fn spawn_motion_forwarder(
     tx
 }
 
-/// Find agent-browser binary in PATH or alongside the cmux binary.
+/// Find the agent-browser binary. Packaged install paths come first (root-owned),
+/// then PATH, then alongside the cmux binary.
 fn which_agent_browser() -> Option<PathBuf> {
-    // Check PATH
+    for dir in ["/usr/lib/cmux", "/usr/lib64/cmux"] {
+        let candidate = PathBuf::from(dir).join("agent-browser");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in path_var.split(':') {
             let candidate = PathBuf::from(dir).join("agent-browser");
@@ -463,7 +490,6 @@ fn which_agent_browser() -> Option<PathBuf> {
             }
         }
     }
-    // Check alongside cmux binary
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("agent-browser");
@@ -472,12 +498,51 @@ fn which_agent_browser() -> Option<PathBuf> {
             }
         }
     }
-    // Check /usr/lib/cmux/ (FHS install path for .deb/.rpm packages)
-    let candidate = PathBuf::from("/usr/lib/cmux/agent-browser");
-    if candidate.is_file() {
-        return Some(candidate);
-    }
     None
+}
+
+/// True when `path` is a socket owned by the current user (lstat, no symlink following).
+fn socket_is_ours(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            meta.file_type().is_socket()
+                && crate::socket::auth::uid_matches(meta.uid(), unsafe { libc::getuid() })
+        }
+        Err(_) => false,
+    }
+}
+
+/// A directory is private when its owner is `expected_uid` and no group/other bits are set.
+fn is_private_owned(owner_uid: u32, mode: u32, expected_uid: u32) -> bool {
+    crate::socket::auth::uid_matches(owner_uid, expected_uid) && mode & 0o077 == 0
+}
+
+/// Create `dir` with mode 0700 if missing, then verify it is ours and private.
+/// A dir we own with looser permissions (created by an older cmux) is tightened to 0700.
+/// A dir owned by someone else is refused.
+fn ensure_private_dir(dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let fail = |e: std::io::Error| format!("socket dir {} unusable: {}", dir.display(), e);
+    let uid = unsafe { libc::getuid() };
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(fail)?;
+    let meta = std::fs::symlink_metadata(dir).map_err(fail)?;
+    if !meta.is_dir() || !crate::socket::auth::uid_matches(meta.uid(), uid) {
+        return Err(format!("socket dir {} is not a directory owned by you", dir.display()));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)?;
+    }
+    let meta = std::fs::symlink_metadata(dir).map_err(fail)?;
+    if !is_private_owned(meta.uid(), meta.mode(), uid) {
+        return Err(format!("socket dir {} is not private (mode 0700 required)", dir.display()));
+    }
+    Ok(())
 }
 
 /// Simple random u64 for request IDs (no external crate needed).
@@ -488,4 +553,39 @@ fn rand_u64() -> u64 {
     std::time::SystemTime::now().hash(&mut hasher);
     std::thread::current().id().hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_owned_requires_owner_and_no_group_or_other_bits() {
+        assert!(is_private_owned(1000, 0o700, 1000));
+        assert!(!is_private_owned(1000, 0o755, 1000), "world-readable dir rejected");
+        assert!(!is_private_owned(1000, 0o770, 1000), "group-accessible dir rejected");
+        assert!(!is_private_owned(0, 0o700, 1000), "foreign owner rejected");
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_and_tightens() {
+        let base = std::env::temp_dir().join(format!("cmux-browser-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let fresh = base.join("fresh");
+        ensure_private_dir(&fresh).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        // A dir we own with loose permissions (from an older cmux) is tightened.
+        let loose = base.join("loose");
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&loose).unwrap();
+        let mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
