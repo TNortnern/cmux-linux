@@ -633,8 +633,9 @@ fn resources_dir_candidates() -> Vec<PathBuf> {
     }
     candidates.push(PathBuf::from("/usr/share/cmux/ghostty"));
     candidates.push(PathBuf::from("/usr/lib/cmux/ghostty"));
-    if cfg!(debug_assertions) {
-        // Dev builds run from a source tree, so use the ghostty checkout nearby.
+    {
+        // Running from a source tree (any profile): use the ghostty checkout nearby. Absent on
+        // installed systems, where the packaged paths above win.
         let repo_ghostty = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ghostty");
         candidates.push(repo_ghostty.join("zig-out/share/ghostty"));
         candidates.push(repo_ghostty.join("src"));

@@ -74,10 +74,30 @@ pub fn shell_pid_for_pane(pane_id: u64) -> Option<i32> {
             continue;
         }
         if pid_has_pane_id(pid as i32, pane_id) {
-            return Some(pid as i32);
+            return Some(deepest_tagged_descendant(pid as i32, pane_id));
         }
     }
     None
+}
+
+/// Ghostty may start the shell through a wrapper (`sh -c ...` → bash). The wrapper never changes
+/// folder, so follow the chain down while a process has exactly one child carrying the same tag.
+fn deepest_tagged_descendant(mut pid: i32, pane_id: u64) -> i32 {
+    for _ in 0..8 {
+        let children = children_of(pid);
+        match children.as_slice() {
+            [only] if pid_has_pane_id(*only, pane_id) => pid = *only,
+            _ => break,
+        }
+    }
+    pid
+}
+
+fn children_of(pid: i32) -> Vec<i32> {
+    // /proc/<pid>/task/<pid>/children lists direct children (Linux 3.5+).
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .map(|s| s.split_whitespace().filter_map(|c| c.parse().ok()).collect())
+        .unwrap_or_default()
 }
 
 /// Folder of a pane's shell. Uses the folder the shell reported when it still exists; otherwise
