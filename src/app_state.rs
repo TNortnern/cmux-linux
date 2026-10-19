@@ -1,6 +1,7 @@
 use crate::ghostty::ffi;
 use crate::session::{self, SessionData, WorkspaceSession, SESSION_VERSION};
 use crate::split_engine::{alloc_pane_id, CloseResult, SplitEngine};
+use crate::tab_bar::TabInfo;
 use crate::workspace::{self, ConnectionState, SavedLayout, Tab, Workspace, WorkspaceUi};
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -14,7 +15,7 @@ pub type AppStateRef = Rc<RefCell<AppState>>;
 thread_local! {
     /// The app's AppState, for callbacks that only carry an id (ghostty's close callback, tab bar).
     /// Set by AppState::new. Main thread only.
-    static APP_STATE: RefCell<Weak<RefCell<AppState>>> = RefCell::new(Weak::new());
+    static APP_STATE: RefCell<Weak<RefCell<AppState>>> = const { RefCell::new(Weak::new()) };
 }
 
 /// Runs `f` on the app state during a later GLib idle. GTK signal handlers use this instead of
@@ -38,8 +39,22 @@ pub fn defer(f: impl FnOnce(&mut AppState) + 'static) {
     });
 }
 
+/// The app state, if it still exists. Only the handle is cloned: no borrow is taken.
+pub fn current_state() -> Option<AppStateRef> {
+    APP_STATE.with(|slot| slot.borrow().upgrade())
+}
+
+/// Runs `f` with the app state handle on a later GLib idle, once no borrow of it is held. For
+/// work that needs the Rc itself, such as a dialog callback that keeps a handle.
+pub fn with_state(f: impl FnOnce(&AppStateRef) + 'static) {
+    glib::idle_add_local_once(move || {
+        if let Some(state) = current_state() {
+            f(&state);
+        }
+    });
+}
+
 /// Requests a debounced session save. Callable from ghostty callbacks; runs now if the state is free.
-#[allow(dead_code)] // Called from the ghostty pwd callback (package T2).
 pub fn request_session_save() {
     let Some(state) = APP_STATE.with(|slot| slot.borrow().upgrade()) else {
         return;
@@ -78,7 +93,7 @@ fn create_engine(app: &gtk4::Application, ghostty_app: ffi::ghostty_app_t, cwd: 
 /// Sidebar row for a local workspace.
 fn local_sidebar_row(name: &str) -> gtk4::ListBoxRow {
     let row = gtk4::ListBoxRow::new();
-    row.set_child(Some(&crate::sidebar::rebuild_sidebar_row_content(name)));
+    row.set_child(Some(&crate::sidebar::row_content(name)));
     row
 }
 
@@ -171,11 +186,11 @@ impl AppState {
         self.workspaces.iter().position(|ws| ws.id == ws_id)
     }
 
-    /// Adds a workspace's sidebar row and its top-level stack page. Does not select it.
+    /// Adds a workspace's sidebar row and its top-level stack page. Does not select it. The row
+    /// is wired here, the only place rows enter the sidebar, so every workspace gets its close
+    /// button and menu.
     fn append_workspace_page(&self, ws: &Workspace, row: gtk4::ListBoxRow) {
-        unsafe {
-            row.set_data("workspace-id", ws.id);
-        }
+        crate::sidebar::wire_row(&row, ws.id);
         self.sidebar_list.append(&row);
         self.stack.add_named(&ws.ui.root, Some(&ws.stack_page_name));
     }
@@ -248,7 +263,11 @@ impl AppState {
         let Some(ws) = self.workspaces.get(wi) else {
             return;
         };
-        let tabs: Vec<(u64, String)> = ws.tabs.iter().map(|t| (t.id, t.name.clone())).collect();
+        let tabs: Vec<TabInfo> = ws
+            .tabs
+            .iter()
+            .map(|t| TabInfo { id: t.id, name: t.name.clone(), attention: t.has_attention() })
+            .collect();
         let active = ws.tabs.get(ws.active_tab).map(|t| t.id).unwrap_or(0);
         ws.ui.tab_bar.set_tabs(&tabs, active);
     }
@@ -349,31 +368,20 @@ impl AppState {
         restored
     }
 
-    /// Build a sidebar row for a workspace. Used by create_remote_workspace.
+    /// Build a sidebar row for a remote workspace: the usual row content plus the SSH connection
+    /// state under the name.
     fn build_sidebar_row(&self, workspace: &Workspace) -> gtk4::ListBoxRow {
-        let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        let label = gtk4::Label::new(Some(&workspace.name));
-        label.set_halign(gtk4::Align::Start);
-        label.set_hexpand(true);
-        vbox.append(&label);
-
+        let hbox = crate::sidebar::row_content(&workspace.name);
         // SSH connection state subtitle (only for remote workspaces)
         if workspace.connection_state.is_remote() {
             let status = gtk4::Label::new(Some(workspace.connection_state.display_text()));
             status.set_halign(gtk4::Align::Start);
             status.add_css_class("connection-state");
             status.add_css_class(workspace.connection_state.css_class());
-            vbox.append(&status);
+            if let Some(vbox) = hbox.first_child().and_downcast::<gtk4::Box>() {
+                vbox.append(&status);
+            }
         }
-        vbox.set_hexpand(true);
-        hbox.append(&vbox);
-
-        // Attention dot — hidden by default, shown when has_attention
-        let dot = gtk4::Label::new(None);
-        dot.add_css_class("attention-dot");
-        dot.set_visible(false);
-        hbox.append(&dot);
 
         let row = gtk4::ListBoxRow::new();
         row.set_child(Some(&hbox));
@@ -464,22 +472,29 @@ impl AppState {
             return false; // Cannot close the last workspace
         }
 
-        // Abort SSH lifecycle task if this is a remote workspace.
-        if let Some(ws) = self.workspaces.get(index) {
-            if let Some(handle) = self.ssh_task_handles.remove(&ws.id) {
-                handle.abort();
-            }
+        let ws_id = self.workspaces[index].id;
+        // Abort the SSH lifecycle task and drop the bridge of a remote workspace.
+        if let Some(handle) = self.ssh_task_handles.remove(&ws_id) {
+            handle.abort();
         }
+        self.workspace_bridges.remove(&ws_id);
 
         // Hide the panes before they are torn down.
-        if index == self.active_index {
+        let was_active = index == self.active_index;
+        if was_active {
             self.set_active_visible(false);
         }
-        // Tear down every built pane's surface and GL state before any widget is removed.
+        // Tear down every built pane's surface and GL state before any widget is removed, and
+        // forget the SSH I/O contexts of its panes.
+        let mut pane_ids = Vec::new();
         for tab in &self.workspaces[index].tabs {
             if let Some(engine) = &tab.engine {
                 engine.teardown_all();
+                pane_ids.extend(engine.all_panes().into_iter().map(|(_, pid, _)| pid));
             }
+        }
+        for pid in pane_ids {
+            self.remote_pane_contexts.remove(&pid);
         }
 
         let workspace = self.workspaces.remove(index);
@@ -494,16 +509,39 @@ impl AppState {
             self.stack.remove(&child);
         }
 
-        // Adjust active_index: if we removed before or at active, clamp.
-        if self.active_index >= self.workspaces.len() {
-            self.active_index = self.workspaces.len() - 1;
-        } else if index <= self.active_index && self.active_index > 0 {
-            self.active_index -= 1;
-        }
+        // When the selected workspace closes, its left neighbour is selected (the new first one
+        // when index 0 closed). Tabs choose their neighbour the same way.
+        self.active_index = if was_active {
+            index.saturating_sub(1)
+        } else if index < self.active_index {
+            self.active_index - 1
+        } else {
+            self.active_index
+        };
+        self.active_index = self.active_index.min(self.workspaces.len() - 1);
 
         self.switch_to_index(self.active_index);
         self.trigger_session_save();
         true
+    }
+
+    /// Closes the workspace with this id. Returns false if it does not exist or is the last one.
+    pub fn close_workspace_by_id(&mut self, ws_id: u64) -> bool {
+        match self.ws_index(ws_id) {
+            Some(index) => self.close_workspace(index),
+            None => false,
+        }
+    }
+
+    /// Selects the workspace with this id and gives keyboard focus to its active pane.
+    pub fn select_workspace_by_id(&mut self, ws_id: u64) {
+        let Some(index) = self.ws_index(ws_id) else {
+            return;
+        };
+        self.switch_to_index(index);
+        if let Some(engine) = self.active_split_engine() {
+            engine.focus_active_surface();
+        }
     }
 
     /// Moves workspace `from` to position `to`, keeping its sidebar row and the selection.
@@ -562,9 +600,7 @@ impl AppState {
 }
 
 // Tab API (Workspace -> Tabs -> Splits). Indexes refer to the active workspace unless the name
-// says otherwise. Shortcuts and the socket reach these through the keymap package; until it is
-// wired, the unused ones are allowed here.
-#[allow(dead_code)]
+// says otherwise.
 impl AppState {
 
     fn new_engine(&self, cwd: Option<PathBuf>) -> SplitEngine {
@@ -577,7 +613,7 @@ impl AppState {
         let wi = self.active_index;
         let ws = self.workspaces.get(wi)?;
         if ws.remote_target.is_some() {
-            eprintln!("cmux: new tabs in SSH workspaces are not supported yet");
+            cmux_info!("new tabs in SSH workspaces are not supported yet");
             return None;
         }
         let cwd = ws.active_engine().and_then(|e| e.focused_cwd());
@@ -599,15 +635,6 @@ impl AppState {
         self.refresh_tab_bar(wi);
         self.trigger_session_save();
         Some(tab_id)
-    }
-
-    /// Opens a tab in the same folder as the active tab, named like it.
-    pub fn duplicate_tab(&mut self) -> Option<u64> {
-        let ws = self.workspaces.get(self.active_index)?;
-        let name = ws.tabs.get(ws.active_tab)?.name.clone();
-        let id = self.new_tab()?;
-        self.rename_active_tab(name);
-        Some(id)
     }
 
     /// Selects tab `ti` of workspace `wi`. Builds the tab if it is still lazy, and moves the
@@ -793,21 +820,6 @@ impl AppState {
         self.close_tab_at(wi, ti)
     }
 
-    /// Closes tab `idx` of the active workspace.
-    pub fn close_tab(&mut self, idx: usize) -> bool {
-        let wi = self.active_index;
-        self.close_tab_at(wi, idx)
-    }
-
-    /// Closes the selected tab of the active workspace.
-    pub fn close_active_tab(&mut self) -> bool {
-        let wi = self.active_index;
-        let Some(ti) = self.workspaces.get(wi).map(|ws| ws.active_tab) else {
-            return false;
-        };
-        self.close_tab_at(wi, ti)
-    }
-
     /// Closes tab `ti` of workspace `wi`. Its panes are torn down before the widget is removed.
     /// Closing a workspace's last tab opens a fresh tab in the same folder first, so a workspace
     /// never has zero tabs.
@@ -881,8 +893,8 @@ impl AppState {
         if index != self.active_index {
             self.set_active_visible(false);
         }
-        // Phase 4: clear attention when user switches to a workspace (D-05).
-        self.clear_workspace_attention(index);
+        // Phase 4: attention clears on the tab the user is shown (D-05). Other tabs keep theirs.
+        self.clear_shown_tab_attention(index);
         self.active_index = index;
         let page_name = self.workspaces[index].stack_page_name.clone();
         self.stack.set_visible_child_name(&page_name);
@@ -962,20 +974,21 @@ impl AppState {
 
     /// Rename the active workspace. Per D-03/D-10: Ctrl+Shift+R (UI wired in Plan 04/05).
     pub fn rename_active(&mut self, new_name: String) {
-        if let Some(ws) = self.workspaces.get_mut(self.active_index) {
-            ws.rename(new_name.clone());
-            // Update the sidebar label (Phase 4 nested layout: row > hbox > vbox > label).
-            if let Some(row) = self.sidebar_list.row_at_index(self.active_index as i32) {
-                if let Some(hbox) = row.child().and_downcast::<gtk4::Box>() {
-                    if let Some(vbox) = hbox.first_child().and_downcast::<gtk4::Box>() {
-                        if let Some(label) = vbox.first_child().and_downcast::<gtk4::Label>() {
-                            label.set_text(&new_name);
-                        }
-                    }
-                }
-            }
-            self.trigger_session_save();
+        if let Some(ws_id) = self.workspaces.get(self.active_index).map(|ws| ws.id) {
+            self.rename_workspace_by_id(ws_id, new_name);
         }
+    }
+
+    /// Renames the workspace with this id, and its sidebar row.
+    pub fn rename_workspace_by_id(&mut self, ws_id: u64, new_name: String) {
+        let Some(index) = self.ws_index(ws_id) else {
+            return;
+        };
+        self.workspaces[index].rename(new_name.clone());
+        if let Some(row) = self.sidebar_list.row_at_index(index as i32) {
+            crate::sidebar::set_row_name(&row, &new_name);
+        }
+        self.trigger_session_save();
     }
 
     /// Returns the active workspace, if any.
@@ -1001,6 +1014,7 @@ impl AppState {
             return;
         };
         self.refresh_attention(idx);
+        self.refresh_tab_bar(idx);
 
         // Desktop notification when window is unfocused (NOTF-03)
         let window_focused = self.gtk_app.active_window()
@@ -1017,7 +1031,8 @@ impl AppState {
         }
     }
 
-    /// Clear all attention in the workspace at `index`, in every tab.
+    /// Clear all attention in the workspace at `index`, in every tab (explicit clear, e.g. from
+    /// the socket's notification.clear).
     pub fn clear_workspace_attention(&mut self, index: usize) {
         if let Some(ws) = self.workspaces.get_mut(index) {
             for tab in ws.tabs.iter_mut() {
@@ -1025,22 +1040,29 @@ impl AppState {
                     engine.root.clear_all_attention();
                 }
             }
-            ws.has_attention = false;
         }
-        self.update_sidebar_attention(index);
+        self.refresh_attention(index);
+        self.refresh_tab_bar(index);
+    }
+
+    /// Clears attention on the selected tab of workspace `index` only: the one the user now sees.
+    /// Other tabs keep their attention until they are shown.
+    fn clear_shown_tab_attention(&mut self, index: usize) {
+        if let Some(ws) = self.workspaces.get_mut(index) {
+            if let Some(engine) = ws.tabs.get_mut(ws.active_tab).and_then(|t| t.engine.as_mut()) {
+                engine.root.clear_all_attention();
+            }
+        }
+        self.refresh_attention(index);
+        self.refresh_tab_bar(index);
     }
 
     /// Update the sidebar dot visibility for workspace at `index`.
     fn update_sidebar_attention(&self, index: usize) {
+        let has_attention = self.workspaces.get(index).is_some_and(|ws| ws.has_attention);
         if let Some(row) = self.sidebar_list.row_at_index(index as i32) {
-            let has_attention = self.workspaces.get(index)
-                .map(|ws| ws.has_attention)
-                .unwrap_or(false);
-            // Row layout: GtkBox(H) > [GtkBox(V) > [GtkLabel(name)], GtkLabel(dot)]
-            if let Some(hbox) = row.child().and_downcast::<gtk4::Box>() {
-                if let Some(dot) = hbox.last_child() {
-                    dot.set_visible(has_attention);
-                }
+            if let Some(dot) = crate::sidebar::attention_dot_of(&row) {
+                dot.set_visible(has_attention);
             }
         }
     }
@@ -1048,7 +1070,7 @@ impl AppState {
     /// Shut down the agent-browser daemon if running (called on app exit).
     pub fn shutdown_browser(&mut self) {
         if let Some(ref mut bm) = self.browser_manager {
-            eprintln!("cmux: shutting down browser daemon");
+            cmux_debug!("shutting down browser daemon");
             bm.shutdown();
             self.browser_manager = None;
         }
@@ -1101,13 +1123,14 @@ impl AppState {
         }
     }
 
-    /// Writes the session now, on this thread. Used on quit and on SIGTERM/SIGHUP, where the
-    /// debounced task may not get to run.
+    /// Writes the session now, on this thread, as the final state. Used on quit and on
+    /// SIGTERM/SIGHUP, where the debounced task may not get to run. Later debounced saves are
+    /// skipped, so a snapshot taken before quit cannot replace this one.
     pub fn flush_session(&self) {
         if self.save_notify.is_none() {
             return;
         }
-        if let Err(e) = session::save_session_atomic(&self.snapshot_session()) {
+        if let Err(e) = session::save_session_final(&self.snapshot_session()) {
             cmux_warn!("session flush failed: {e}");
         }
     }
@@ -1161,10 +1184,10 @@ fn send_bell_notification(_app: &gtk4::Application, workspace_name: &str, _works
             .status();
         match result {
             Ok(status) if !status.success() => {
-                eprintln!("cmux: notify-send exited with {status}");
+                cmux_warn!("notify-send exited with {status}");
             }
             Err(e) => {
-                eprintln!("cmux: failed to run notify-send: {e}");
+                cmux_warn!("failed to run notify-send: {e}");
             }
             _ => {}
         }

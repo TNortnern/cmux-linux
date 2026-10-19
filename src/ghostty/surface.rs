@@ -1,7 +1,7 @@
 use crate::ghostty::cwd::{new_track, validate_cwd, PaneTrackCell};
 use crate::ghostty::ffi;
 use gtk4::glib;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::rc::Rc;
@@ -22,6 +22,11 @@ pub enum SurfaceIoMode {
 /// surface goes through this cell, so a freed surface is never reachable from the tree.
 pub type SurfaceCell = Rc<RefCell<Option<ffi::ghostty_surface_t>>>;
 
+/// Owner handle for a pane's context pointer. Teardown takes the pointer out of the cell before
+/// it frees the context, so a second teardown sees null, and a realize that comes late sees null
+/// and creates nothing.
+pub type CtxCell = Rc<Cell<*mut PaneCtx>>;
+
 /// Per-pane context handed to Ghostty as surface userdata. Allocated once per pane in
 /// `create_surface`; freed exactly once by `teardown_pane`, after the surface is freed.
 pub struct PaneCtx {
@@ -36,6 +41,12 @@ pub struct PaneCtx {
     initial_cwd: Option<CString>,
     /// Environment for the shell, e.g. `CMUX_PANE_ID=<id>`. Copied by Ghostty at realize.
     env: Vec<(CString, CString)>,
+    /// Wanted occlusion state: false while the pane's tab or workspace is hidden. Applied when
+    /// the surface is created and by `SplitEngine::set_visible`, so it holds before realize too.
+    pub visible: Cell<bool>,
+    /// The `Arc` raw pointer given to Ghostty as `io_write_userdata` (SSH panes). Reclaimed by
+    /// `teardown_pane` once the surface is gone.
+    io_write_raw: Cell<*const crate::ssh::bridge::IoWriteContext>,
 }
 
 /// Owned handles for one new pane, returned by `create_surface`.
@@ -43,7 +54,7 @@ pub struct PaneSurface {
     pub gl_area: gtk4::GLArea,
     pub surface: SurfaceCell,
     /// Heap `PaneCtx` owned by the pane. Freed by `teardown_pane`.
-    pub ctx: *mut PaneCtx,
+    pub ctx: CtxCell,
     /// Same track as `PaneCtx::track`, for the split tree's leaf.
     pub track: PaneTrackCell,
 }
@@ -51,13 +62,25 @@ pub struct PaneSurface {
 /// Empty NUL-terminated string, used to deny a clipboard request.
 const EMPTY_C_STR: &[u8] = b"\0";
 
-/// Borrows the pane context from Ghostty's userdata pointer.
+/// Borrows the pane context behind Ghostty's userdata pointer. Returns None unless the context
+/// is still registered as live, so a stale userdata pointer is never dereferenced.
 ///
 /// # Safety
-/// `userdata` must be null or a `PaneCtx` pointer from `create_surface` that has not
-/// been freed by `teardown_pane`.
+/// `userdata` must be null, or a pointer that was a `PaneCtx` from `create_surface`. A registered
+/// address is one that has not been freed, because `teardown_pane` unregisters before it frees.
 unsafe fn pane_ctx<'a>(userdata: *mut std::ffi::c_void) -> Option<&'a PaneCtx> {
+    let addr = userdata as usize;
+    if addr == 0 || !crate::ghostty::callbacks::live_ctx_registered(addr) {
+        return None;
+    }
     (userdata as *const PaneCtx).as_ref()
+}
+
+/// Runs `f` on the pane context behind `cell`, if teardown has not taken it.
+pub fn with_pane_ctx<R>(cell: &CtxCell, f: impl FnOnce(&PaneCtx) -> R) -> Option<R> {
+    // SAFETY: teardown takes the pointer out of the cell before it frees the context, and both
+    // run on the GLib main thread. A non-null value is therefore a live context.
+    unsafe { cell.get().as_ref() }.map(f)
 }
 
 /// Call glGetError() via FFI to check for GL errors after ghostty calls.
@@ -70,13 +93,14 @@ fn gl_get_error() -> u32 {
 }
 
 /// Releases one pane's GL and surface state. Must run before the pane's GLArea is removed
-/// from the widget tree, and exactly once per pane (it frees `ctx`).
+/// from the widget tree. Idempotent: a second call finds the surface and the context already
+/// taken, and does nothing.
 ///
-/// Order: deregister the GLArea and take the surface out of its cell, so no callback can
-/// reach either; unrealize GL resources while the context is current; free the surface;
-/// free the context.
-pub fn teardown_pane(gl_area: &gtk4::GLArea, surface: &SurfaceCell, ctx: *mut PaneCtx) {
-    use crate::ghostty::callbacks::{GL_AREA_REGISTRY, GL_TO_SURFACE, SURFACE_REGISTRY};
+/// Order: deregister the GLArea and take the surface and context out of their cells, so no
+/// callback can reach them; unregister the context; unrealize GL resources while the context is
+/// current; free the surface; free the context and the SSH writer reference it kept.
+pub fn teardown_pane(gl_area: &gtk4::GLArea, surface: &SurfaceCell, ctx: &CtxCell) {
+    use crate::ghostty::callbacks::{GL_AREA_REGISTRY, GL_TO_SURFACE, LIVE_CTXS, SURFACE_REGISTRY};
     use gtk4::prelude::*;
 
     let area_key = gl_area.as_ptr() as usize;
@@ -92,6 +116,15 @@ pub fn teardown_pane(gl_area: &gtk4::GLArea, surface: &SurfaceCell, ctx: *mut Pa
         if let Ok(mut reg) = SURFACE_REGISTRY.lock() {
             reg.remove(&(s as usize));
         }
+    }
+    let ctx_ptr = ctx.replace(std::ptr::null_mut());
+    if !ctx_ptr.is_null() {
+        if let Ok(mut live) = LIVE_CTXS.lock() {
+            live.remove(&(ctx_ptr as usize));
+        }
+    }
+
+    if let Some(s) = taken {
         // A realized GLArea still owns GL objects. An unrealized one was already released
         // by the unrealize callback.
         if gl_area.is_realized() {
@@ -105,9 +138,15 @@ pub fn teardown_pane(gl_area: &gtk4::GLArea, surface: &SurfaceCell, ctx: *mut Pa
         }
     }
 
-    if !ctx.is_null() {
+    if !ctx_ptr.is_null() {
+        // SAFETY: the pointer came from Box::into_raw in create_surface, was taken out of the cell
+        // above, and the surface that referenced it has been freed, so nothing can reach it now.
         unsafe {
-            drop(Box::from_raw(ctx));
+            let io_raw = (*ctx_ptr).io_write_raw.replace(std::ptr::null());
+            drop(Box::from_raw(ctx_ptr));
+            if !io_raw.is_null() {
+                drop(std::sync::Arc::from_raw(io_raw));
+            }
         }
     }
 }
@@ -130,15 +169,11 @@ pub fn create_surface(
 
     use crate::ghostty::callbacks;
 
-    eprintln!(
-        "cmux: create_surface called for pane_id={}, inherited_config={}",
-        pane_id,
-        inherited_config.is_some()
-    );
+    cmux_debug!("create_surface called for pane_id={}, inherited_config={}", pane_id, inherited_config.is_some());
 
-    let initial_cwd = cwd
-        .as_deref()
-        .and_then(validate_cwd)
+    let initial_dir = cwd.as_deref().and_then(validate_cwd);
+    let initial_cwd = initial_dir
+        .as_ref()
         .and_then(|path| CString::new(path.as_os_str().as_bytes()).ok());
     // Tags the shell so /proc lookup can find it when shell integration is absent.
     let env = vec![(
@@ -146,8 +181,12 @@ pub fn create_surface(
         CString::new(pane_id.to_string()).expect("digits have no NUL"),
     )];
     let track = new_track();
-    if let (SurfaceIoMode::Manual { .. }, Ok(mut t)) = (&io_mode, track.lock()) {
-        t.remote = true;
+    if let Ok(mut t) = track.lock() {
+        // Folder answers queried before the shell reports one (or before realize).
+        t.initial = initial_dir;
+        if matches!(io_mode, SurfaceIoMode::Manual { .. }) {
+            t.remote = true;
+        }
     }
 
     let gl_area = gtk4::GLArea::new();
@@ -172,6 +211,7 @@ pub fn create_surface(
 
     // Per-pane context: Ghostty passes it back as userdata to clipboard and close callbacks.
     // Freed by teardown_pane, never by Drop.
+    let ctx_cell: CtxCell = Rc::new(Cell::new(std::ptr::null_mut()));
     let ctx: *mut PaneCtx = Box::into_raw(Box::new(PaneCtx {
         pane_id,
         surface: surface_cell.clone(),
@@ -179,7 +219,13 @@ pub fn create_surface(
         track: track.clone(),
         initial_cwd,
         env,
+        visible: Cell::new(true),
+        io_write_raw: Cell::new(std::ptr::null()),
     }));
+    ctx_cell.set(ctx);
+    if let Ok(mut live) = callbacks::LIVE_CTXS.lock() {
+        live.insert(ctx as usize);
+    }
 
     // ── GtkGLArea::realize ───────────────────────────────────────────────────
     // GL context is now valid. Create the surface HERE so ghostty can access
@@ -190,12 +236,18 @@ pub fn create_surface(
     // exists and reuse it, otherwise we create orphaned surfaces that never render.
     gl_area.connect_realize({
         let cell = surface_cell.clone();
+        let ctx_cell = ctx_cell.clone();
         let io_mode = io_mode;
         move |area| {
+            // Torn down before GTK realized it: the context is gone, so there is nothing to create.
+            if ctx_cell.get().is_null() {
+                return;
+            }
             area.make_current();
             if let Some(err) = area.error() {
-                eprintln!("cmux: GLArea realize error: {err}");
-                std::process::exit(1); // Per D-09: no GUI error dialog in Phase 1
+                // Per D-09: no GUI error dialog in Phase 1
+                cmux_warn!("GLArea realize error: {err}");
+                std::process::exit(1);
             }
 
             // Check if surface already exists (re-realize after reparent).
@@ -234,13 +286,15 @@ pub fn create_surface(
             // Log GL version and renderer info for diagnostics.
             if let Some(gl_ctx) = area.context() {
                 let (major, minor) = gl_ctx.version();
-                eprintln!("cmux: GL context version: {major}.{minor}");
+                cmux_debug!("GL context version: {major}.{minor}");
             }
 
             // Create the ghostty surface now that GL context is current.
             // The folder and env strings live in PaneCtx; these arrays only need to outlive
             // ghostty_surface_new, which copies them.
-            let ctx_ref = unsafe { pane_ctx(ctx as *mut std::ffi::c_void) };
+            let ctx_ptr = ctx_cell.get();
+            // SAFETY: non-null, so the context has not been taken by teardown (see the guard above).
+            let ctx_ref: Option<&PaneCtx> = unsafe { ctx_ptr.as_ref() };
             let mut env_vars: Vec<ffi::ghostty_env_var_s> = ctx_ref
                 .map(|c| {
                     c.env
@@ -255,6 +309,7 @@ pub fn create_surface(
             let cwd_ptr = ctx_ref
                 .and_then(|c| c.initial_cwd.as_ref())
                 .map_or(std::ptr::null(), |c| c.as_ptr());
+            let visible = ctx_ref.is_none_or(|c| c.visible.get());
 
             let surface = unsafe {
                 let gl_area_ptr = area.as_ptr() as *mut std::ffi::c_void;
@@ -274,7 +329,7 @@ pub fn create_surface(
                 surface_config.platform_tag = ffi::ghostty_platform_e_GHOSTTY_PLATFORM_GTK4;
                 surface_config.platform = platform;
                 // Surface callbacks (clipboard, close) receive this pointer as userdata.
-                surface_config.userdata = ctx as *mut std::ffi::c_void;
+                surface_config.userdata = ctx_ptr as *mut std::ffi::c_void;
                 surface_config.scale_factor = area.scale_factor() as f64;
                 // cmux's tracked folder is the source of truth, so this replaces any
                 // working_directory carried by an inherited config (null = Ghostty's default).
@@ -286,21 +341,26 @@ pub fn create_surface(
                 if let SurfaceIoMode::Manual { ref io_write_ctx } = io_mode {
                     surface_config.io_mode = ffi::ghostty_surface_io_mode_e_GHOSTTY_SURFACE_IO_MANUAL;
                     surface_config.io_write_cb = Some(crate::ssh::bridge::ssh_io_write_cb);
-                    // Increment Arc refcount for the raw pointer — the matching
-                    // Arc::from_raw happens in unrealize/cleanup.
-                    let ctx_raw = std::sync::Arc::into_raw(io_write_ctx.clone()) as *mut std::ffi::c_void;
-                    surface_config.io_write_userdata = ctx_raw;
+                    // Increment Arc refcount for the raw pointer. teardown_pane reclaims it
+                    // (Arc::from_raw) after the surface is freed.
+                    let io_raw = std::sync::Arc::into_raw(io_write_ctx.clone());
+                    if let Some(c) = ctx_ref {
+                        c.io_write_raw.set(io_raw);
+                    }
+                    surface_config.io_write_userdata = io_raw as *mut std::ffi::c_void;
                 }
 
                 let s = ffi::ghostty_surface_new(ghostty_app, &surface_config);
                 if s.is_null() {
-                    eprintln!("cmux: FATAL — ghostty_surface_new returned null");
+                    cmux_warn!("FATAL: ghostty_surface_new returned null");
                     std::process::exit(1);
                 }
+                // Hidden panes start hidden: occlusion may have been set before realize.
+                ffi::ghostty_surface_set_occlusion(s, visible);
                 // Check GL error state after surface creation.
                 let gl_err = gl_get_error();
                 if gl_err != 0 {
-                    eprintln!("cmux: GL error after ghostty_surface_new: 0x{gl_err:x}");
+                    cmux_warn!("GL error after ghostty_surface_new: 0x{gl_err:x}");
                 }
                 s
             };
@@ -339,7 +399,7 @@ pub fn create_surface(
             // teardown_pane removes it again.
             if let Ok(mut areas) = callbacks::GL_AREA_REGISTRY.lock() {
                 areas.push(callbacks::GtkGLAreaPtr(
-                    area.as_ptr() as *mut gtk4::ffi::GtkGLArea
+                    area.as_ptr()
                 ));
             }
             // Register GLArea → surface mapping for notify::position focus restore
@@ -675,7 +735,7 @@ pub fn create_surface(
     PaneSurface {
         gl_area,
         surface: surface_cell,
-        ctx,
+        ctx: ctx_cell,
         track,
     }
 }
@@ -687,6 +747,40 @@ pub fn create_surface(
 // comes back through confirm_read_clipboard_cb, which tells them apart by request type.
 // Each callback takes the pane from its own userdata, so a request is always completed
 // on the surface that made it.
+//
+// read_clipboard_cb never blocks: it is called from inside ghostty_app_tick, and a nested
+// main loop there would re-enter ghostty. The read finishes on a later main-loop turn.
+
+/// Completes a clipboard read on its pane's surface, if the pane still exists.
+///
+/// The request is identified by pane id as well as surface address, so a freed surface whose
+/// address was reused by a later pane is never completed with the wrong request.
+fn complete_clipboard_read(pane_id: u64, surface_addr: usize, request_addr: usize, text: Option<&str>) {
+    use crate::ghostty::callbacks::SURFACE_REGISTRY;
+    let still_registered = SURFACE_REGISTRY
+        .lock()
+        .map(|reg| reg.get(&surface_addr).copied() == Some(pane_id))
+        .unwrap_or(false);
+    if !still_registered {
+        return;
+    }
+    let c_text = text.and_then(|s| CString::new(s).ok());
+    let text_ptr = match c_text.as_ref() {
+        Some(s) => s.as_ptr(),
+        // Always answer: a null string would crash Ghostty, and an unanswered request leaks.
+        None => EMPTY_C_STR.as_ptr() as *const std::ffi::c_char,
+    };
+    // confirmed=false: ghostty asks for confirmation (via confirm_read_clipboard_cb)
+    // instead of completing OSC 52 reads or unsafe pastes on its own.
+    unsafe {
+        ffi::ghostty_surface_complete_clipboard_request(
+            surface_addr as ffi::ghostty_surface_t,
+            text_ptr,
+            request_addr as *mut std::ffi::c_void,
+            false,
+        );
+    }
+}
 
 pub(crate) unsafe extern "C" fn read_clipboard_cb(
     userdata: *mut std::ffi::c_void,
@@ -702,33 +796,27 @@ pub(crate) unsafe extern "C" fn read_clipboard_cb(
         return;
     };
 
-    // Read clipboard text synchronously using GLib event loop.
-    // gtk4::glib::MainContext::block_on runs the async future on the current (main) thread.
-    // This is safe here because read_clipboard_cb is called from the GLib main thread.
-    let text: Option<glib::GString> = gtk4::gdk::Display::default().and_then(|display| {
-        let clipboard = if clipboard_type == ffi::ghostty_clipboard_e_GHOSTTY_CLIPBOARD_SELECTION {
+    // The request type is not passed here. An OSC 52 read therefore also reads the clipboard
+    // in this step, but its text only leaves through a confirmed completion. cmux's default
+    // (clipboard-read = deny) means Ghostty never asks for OSC 52 reads at all.
+    let pane_id = ctx.pane_id;
+    let surface_addr = surface as usize;
+    let request_addr = request as usize;
+    let selection = clipboard_type == ffi::ghostty_clipboard_e_GHOSTTY_CLIPBOARD_SELECTION;
+    let clipboard = gtk4::gdk::Display::default().map(|display| {
+        if selection {
             display.primary_clipboard()
         } else {
             display.clipboard()
-        };
-        glib::MainContext::default()
-            .block_on(clipboard.read_text_future())
-            .ok()
-            .flatten()
+        }
     });
-
-    let c_text = text.and_then(|s| std::ffi::CString::new(s.as_str()).ok());
-    let text_ptr = match c_text.as_ref() {
-        Some(s) => s.as_ptr(),
-        // Always answer: a null string would crash Ghostty, and an unanswered request leaks.
-        None => EMPTY_C_STR.as_ptr() as *const std::ffi::c_char,
-    };
-
-    // confirmed=false: ghostty asks for confirmation (via confirm_read_clipboard_cb)
-    // instead of completing OSC 52 reads or unsafe pastes on its own.
-    unsafe {
-        ffi::ghostty_surface_complete_clipboard_request(surface, text_ptr, request, false);
-    }
+    glib::MainContext::default().spawn_local(async move {
+        let text = match clipboard {
+            Some(clipboard) => clipboard.read_text_future().await.ok().flatten(),
+            None => None,
+        };
+        complete_clipboard_read(pane_id, surface_addr, request_addr, text.as_deref());
+    });
 }
 
 pub(crate) unsafe extern "C" fn confirm_read_clipboard_cb(

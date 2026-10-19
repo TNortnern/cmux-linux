@@ -226,7 +226,7 @@ fn main() {
                     latest = Some(data);
                 }
                 if let Some(session) = latest {
-                    if let Err(e) = crate::session::save_session_atomic(&session) {
+                    if let Err(e) = crate::session::save_session_debounced(&session) {
                         cmux_warn!("session save failed: {e}");
                     }
                 }
@@ -369,7 +369,7 @@ fn build_ui(
     );
 
     // Wire sidebar click-to-switch.
-    crate::sidebar::wire_sidebar_clicks(&sidebar_list, state.clone());
+    crate::sidebar::wire_sidebar_clicks(&sidebar_list);
 
     // Set save_notify, session_tx, and SSH event channel on AppState.
     let (ssh_event_tx, mut ssh_event_rx) = tokio::sync::mpsc::unbounded_channel::<crate::ssh::SshEvent>();
@@ -392,17 +392,6 @@ fn build_ui(
         cmux_debug!("restored {} workspace(s) from session", restored);
         if restored == 0 {
             state.borrow_mut().create_workspace();
-        }
-    }
-
-    // Phase 9: Wire close buttons + context menus on all sidebar rows created above.
-    {
-        let n = sidebar_list.observe_children().n_items();
-        for i in 0..n {
-            if let Some(row) = sidebar_list.row_at_index(i as i32) {
-                crate::sidebar::wire_row_close_button(&row, state.clone(), app);
-                crate::sidebar::attach_sidebar_context_menu(&row, state.clone());
-            }
         }
     }
 
@@ -450,13 +439,14 @@ fn build_ui(
     // Signals that end the process without a GTK close (kill, terminal hangup, Ctrl+C) save the
     // layout first, then quit through the normal path. The flush runs on the GLib main loop.
     for signum in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
-        let state_for_signal = state.clone();
         let app_for_signal = app.clone();
         let _ = glib::unix_signal_add_local(signum, move || {
-            if let Ok(s) = state_for_signal.try_borrow() {
+            // If AppState is busy right now, the flush and the quit wait for a later idle.
+            let app = app_for_signal.clone();
+            crate::app_state::defer(move |s| {
                 s.flush_session();
-            }
-            app_for_signal.quit();
+                app.quit();
+            });
             glib::ControlFlow::Break
         });
     }
@@ -482,7 +472,7 @@ fn build_ui(
     // Storing sidebar_scroll on the stack is enough for now. Plan 05 will pass it to shortcuts.
 
     // Phase 9: Register GIO actions for menu/button dispatch
-    crate::menus::register_actions(&window, state.clone(), &sidebar_box, app);
+    crate::menus::register_actions(&window, &sidebar_box, app);
     crate::menus::register_accels(app);
 
     // 7. Install keyboard shortcuts (config-driven, D-06)
@@ -525,6 +515,15 @@ fn check_bells() {
     });
 }
 
+/// The Ghostty surface of pane `pane_id`, if it is registered. The registry lock is released
+/// before the caller calls into Ghostty.
+fn surface_for_pane(pane_id: u64) -> Option<crate::ghostty::ffi::ghostty_surface_t> {
+    let registry = crate::ghostty::callbacks::SURFACE_REGISTRY.lock().ok()?;
+    let found = registry.iter().find(|(_, &pid)| pid == pane_id).map(|(&sptr, _)| sptr);
+    drop(registry);
+    found.map(|sptr| sptr as crate::ghostty::ffi::ghostty_surface_t)
+}
+
 /// Applies one SSH event on the GTK main thread.
 fn handle_ssh_event(event: crate::ssh::SshEvent, state: &crate::app_state::AppStateRef) {
     match event {
@@ -541,48 +540,40 @@ fn handle_ssh_event(event: crate::ssh::SshEvent, state: &crate::app_state::AppSt
             state.borrow_mut().update_connection_state(workspace_id, conn_state);
         }
         crate::ssh::SshEvent::RemoteOutput { pane_id, data } => {
-            // Dispatch remote output to the Ghostty surface via process_output.
-            if let Ok(registry) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                let surface_ptr = registry.iter()
-                    .find(|(_, &pid)| pid == pane_id)
-                    .map(|(&sptr, _)| sptr as crate::ghostty::ffi::ghostty_surface_t);
-                if let Some(surface) = surface_ptr {
-                    unsafe {
-                        crate::ghostty::ffi::ghostty_surface_process_output(
-                            surface,
-                            data.as_ptr() as *const _,
-                            data.len(),
-                        );
-                    }
-                    // Queue render for the GLArea associated with this surface
-                    if let Ok(gl_areas) = crate::ghostty::callbacks::GL_TO_SURFACE.lock() {
-                        for (&gl_ptr, &s_ptr) in gl_areas.iter() {
-                            if s_ptr == surface as usize {
-                                let area: glib::translate::Borrowed<gtk4::GLArea> =
-                                    unsafe { glib::translate::from_glib_borrow(gl_ptr as *mut gtk4::ffi::GtkGLArea) };
-                                area.queue_render();
-                                break;
-                            }
-                        }
-                    }
+            // Dispatch remote output to the Ghostty surface via process_output. The registry is
+            // read into a local first: Ghostty may re-enter callbacks that take the same lock.
+            if let Some(surface) = surface_for_pane(pane_id) {
+                unsafe {
+                    crate::ghostty::ffi::ghostty_surface_process_output(
+                        surface,
+                        data.as_ptr() as *const _,
+                        data.len(),
+                    );
+                }
+                // Queue render for the GLArea associated with this surface
+                let gl_ptr = {
+                    let map = crate::ghostty::callbacks::GL_TO_SURFACE.lock();
+                    map.ok().and_then(|map| {
+                        map.iter().find(|(_, &s)| s == surface as usize).map(|(&g, _)| g)
+                    })
+                };
+                if let Some(gl_ptr) = gl_ptr {
+                    let area: glib::translate::Borrowed<gtk4::GLArea> =
+                        unsafe { glib::translate::from_glib_borrow(gl_ptr as *mut gtk4::ffi::GtkGLArea) };
+                    area.queue_render();
                 }
             }
         }
         crate::ssh::SshEvent::RemoteEof { pane_id } => {
             // D-08: write exit message to surface, keep pane open for user to close
-            if let Ok(registry) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                let surface_ptr = registry.iter()
-                    .find(|(_, &pid)| pid == pane_id)
-                    .map(|(&sptr, _)| sptr as crate::ghostty::ffi::ghostty_surface_t);
-                if let Some(surface) = surface_ptr {
-                    let msg = b"\r\n\x1b[90m[Remote shell exited. Press any key to close]\x1b[0m\r\n";
-                    unsafe {
-                        crate::ghostty::ffi::ghostty_surface_process_output(
-                            surface,
-                            msg.as_ptr() as *const _,
-                            msg.len(),
-                        );
-                    }
+            if let Some(surface) = surface_for_pane(pane_id) {
+                let msg = b"\r\n\x1b[90m[Remote shell exited. Press any key to close]\x1b[0m\r\n";
+                unsafe {
+                    crate::ghostty::ffi::ghostty_surface_process_output(
+                        surface,
+                        msg.as_ptr() as *const _,
+                        msg.len(),
+                    );
                 }
             }
             // Clear stream_id and set eof flag so next keypress triggers close

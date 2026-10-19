@@ -13,6 +13,13 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Maximum concurrent client connections. Extra connections are closed immediately.
 const MAX_CONNECTIONS: usize = 64;
 
+/// A connection that sends no request for this long is closed, so idle clients cannot hold a
+/// connection permit forever.
+const IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a request may wait for the GTK thread to answer it.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Compute the Unix socket path per D-06.
 /// $XDG_RUNTIME_DIR/cmux/cmux.sock, fallback /run/user/{uid}/cmux/cmux.sock.
 pub fn socket_path() -> PathBuf {
@@ -50,11 +57,11 @@ pub fn start_socket_server(
 
     // Create directory with restrictive permissions.
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("cmux: socket dir create failed: {e}");
+        cmux_warn!("socket dir create failed: {e}");
         return;
     }
     if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
-        eprintln!("cmux: socket dir chmod failed: {e}");
+        cmux_warn!("socket dir chmod failed: {e}");
     }
 
     // Remove stale socket from previous run (ignore ENOENT).
@@ -66,22 +73,22 @@ pub fn start_socket_server(
     let listener = match tokio::net::UnixListener::bind(&sock_path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("cmux: socket bind failed at {}: {e}", sock_path.display());
+            cmux_warn!("socket bind failed at {}: {e}", sock_path.display());
             return;
         }
     };
 
     // Set socket file mode to 0600 (owner read/write only).
     if let Err(e) = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)) {
-        eprintln!("cmux: socket chmod failed: {e}");
+        cmux_warn!("socket chmod failed: {e}");
     }
 
     // Write last-socket-path marker so cmux.py can discover the socket.
     if let Err(e) = std::fs::write(last_socket_path_marker(), sock_path.to_string_lossy().as_bytes()) {
-        eprintln!("cmux: last-socket-path write failed: {e}");
+        cmux_warn!("last-socket-path write failed: {e}");
     }
 
-    eprintln!("cmux: socket server listening at {}", sock_path.display());
+    cmux_info!("socket server listening at {}", sock_path.display());
 
     // Spawn the accept loop in tokio.
     let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
@@ -100,20 +107,20 @@ pub fn start_socket_server(
                                 });
                             }
                             Err(_) => {
-                                eprintln!("cmux: socket connection limit reached, rejecting");
+                                cmux_warn!("socket connection limit reached, rejecting");
                             }
                         },
                         Ok(false) => {
-                            eprintln!("cmux: socket connection rejected (UID mismatch)");
+                            cmux_warn!("socket connection rejected (UID mismatch)");
                         }
                         Err(e) => {
-                            eprintln!("cmux: SO_PEERCRED check failed: {e}");
+                            cmux_warn!("SO_PEERCRED check failed: {e}");
                         }
                     }
                 }
                 Err(e) => {
                     // Transient (e.g. EMFILE): log, back off briefly, keep serving.
-                    eprintln!("cmux: socket accept error: {e}");
+                    cmux_warn!("socket accept error: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
@@ -171,10 +178,11 @@ async fn handle_connection(
     let mut reader = BufReader::new(reader);
 
     loop {
-        let bytes = match read_capped_line(&mut reader, MAX_REQUEST_BYTES).await {
-            Ok(LineRead::Line(bytes)) => bytes,
-            Ok(LineRead::Eof) | Err(_) => break,
-            Ok(LineRead::TooLong) => {
+        let bytes = match tokio::time::timeout(IDLE_READ_TIMEOUT, read_capped_line(&mut reader, MAX_REQUEST_BYTES)).await {
+            Ok(Ok(LineRead::Line(bytes))) => bytes,
+            // EOF, a read error, or no request within IDLE_READ_TIMEOUT: close the connection.
+            Ok(Ok(LineRead::Eof)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(LineRead::TooLong)) => {
                 let response = serde_json::json!({
                     "id": null,
                     "ok": false,
@@ -426,11 +434,21 @@ async fn dispatch_line(
         }).to_string();
     }
 
-    resp_rx.await.unwrap_or_else(|_| serde_json::json!({
-        "id": req_id,
-        "ok": false,
-        "error": {"code": "internal_error", "message": "handler dropped response"}
-    })).to_string()
+    match tokio::time::timeout(RESPONSE_TIMEOUT, resp_rx).await {
+        Ok(Ok(response)) => response.to_string(),
+        Ok(Err(_)) => serde_json::json!({
+            "id": req_id,
+            "ok": false,
+            "error": {"code": "internal_error", "message": "handler dropped response"}
+        })
+        .to_string(),
+        Err(_) => serde_json::json!({
+            "id": req_id,
+            "ok": false,
+            "error": {"code": "timeout", "message": "the app did not answer in time"}
+        })
+        .to_string(),
+    }
 }
 
 #[cfg(test)]

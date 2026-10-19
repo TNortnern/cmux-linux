@@ -128,6 +128,11 @@ impl Tab {
         }
     }
 
+    /// True if a pane in this tab has unread bell activity. A lazy tab has none.
+    pub fn has_attention(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.root.any_attention())
+    }
+
     /// Session entry for this tab, or None if it has no terminal to save.
     pub fn session_entry(&self) -> Option<TabSession> {
         match (&self.engine, &self.saved) {
@@ -256,12 +261,9 @@ impl Workspace {
         format!("Tab {n}")
     }
 
-    /// True if a pane in any built tab has unread bell activity.
+    /// True if a pane in any tab has unread bell activity.
     pub fn any_attention(&self) -> bool {
-        self.tabs
-            .iter()
-            .filter_map(|t| t.engine.as_ref())
-            .any(|e| e.root.any_attention())
+        self.tabs.iter().any(|t| t.has_attention())
     }
 }
 

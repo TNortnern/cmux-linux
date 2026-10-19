@@ -1,4 +1,4 @@
-use crate::app_state::AppState;
+use crate::app_state::{defer, AppState};
 use crate::config::ShortcutAction;
 use crate::split_engine::FocusDirection;
 use gtk4::prelude::*;
@@ -44,7 +44,7 @@ pub fn install_shortcuts(
             match action {
                 // -- Tabs --
                 ShortcutAction::NewTab => handle_new_tab(&state),
-                ShortcutAction::ClosePane => handle_close_pane(&state, &app_clone),
+                ShortcutAction::ClosePane => handle_close_pane(&state),
                 ShortcutAction::NextTab => state.borrow_mut().next_tab(),
                 ShortcutAction::PrevTab => state.borrow_mut().prev_tab(),
                 ShortcutAction::LastTab => state.borrow_mut().select_last_tab(),
@@ -72,7 +72,7 @@ pub fn install_shortcuts(
                 ShortcutAction::ZoomPane => handle_zoom(&state),
                 ShortcutAction::Equalize => handle_equalize(&state),
                 // -- Workspaces --
-                ShortcutAction::NewWorkspace => handle_new_workspace(&state, &app_clone),
+                ShortcutAction::NewWorkspace => handle_new_workspace(&state),
                 ShortcutAction::Workspace1 => state.borrow_mut().switch_to_index(0),
                 ShortcutAction::Workspace2 => state.borrow_mut().switch_to_index(1),
                 ShortcutAction::Workspace3 => state.borrow_mut().switch_to_index(2),
@@ -92,7 +92,7 @@ pub fn install_shortcuts(
                 }
                 // Find is still a stub (its win.find action is disabled), so the key reaches the terminal.
                 ShortcutAction::Find => return gtk4::glib::Propagation::Proceed,
-                ShortcutAction::NewSshWorkspace => handle_new_ssh_workspace(&state, &app_clone),
+                ShortcutAction::NewSshWorkspace => handle_new_ssh_workspace(&state),
                 ShortcutAction::Preferences => {
                     let _ = gtk4::prelude::WidgetExt::activate_action(&window_clone, "win.preferences", None);
                 }
@@ -129,7 +129,7 @@ fn is_workspace_digit(action: ShortcutAction) -> bool {
 /// `base_is_digit`: the key's keyval without the AltGr level is a digit.
 /// `typed`: the printable character the event's keyval produces, if any.
 pub fn ctrl_alt_digit_is_shortcut(base_is_digit: bool, typed: Option<char>) -> bool {
-    base_is_digit && typed.map_or(true, |c| c.is_ascii_digit())
+    base_is_digit && typed.is_none_or(|c| c.is_ascii_digit())
 }
 
 /// Reads the keyboard map for `keycode` and applies `ctrl_alt_digit_is_shortcut`.
@@ -180,21 +180,25 @@ pub fn handle_equalize(state: &Rc<RefCell<AppState>>) {
 }
 
 /// Create a new workspace with an initial GLArea pane and add it to AppState + GtkStack.
-pub fn handle_new_workspace(state: &Rc<RefCell<AppState>>, app: &gtk4::Application) {
+/// The sidebar row gets its close button and menu when AppState adds it.
+pub fn handle_new_workspace(state: &Rc<RefCell<AppState>>) {
     state.borrow_mut().create_workspace();
-    // Wire close button + context menu on the newly created sidebar row
-    let sidebar_list = state.borrow().sidebar_list.clone();
-    crate::sidebar::wire_latest_row(&sidebar_list, state.clone(), app);
 }
 
-/// Show close-workspace confirmation dialog. If confirmed, closes the active workspace.
-pub fn handle_close_workspace(state: &Rc<RefCell<AppState>>, app: &gtk4::Application) {
+/// Asks to close the active workspace (keyboard, menu).
+pub fn handle_close_workspace(state: &Rc<RefCell<AppState>>) {
+    let active = state.borrow().active_workspace().map(|ws| ws.id);
+    if let Some(ws_id) = active {
+        let app = state.borrow().gtk_app.clone();
+        confirm_close_workspace(state, &app, ws_id);
+    }
+}
+
+/// Shows the close-workspace confirmation for workspace `ws_id`. If confirmed, the workspace is
+/// closed by id, on a later idle, once no borrow of AppState is held.
+pub fn confirm_close_workspace(state: &Rc<RefCell<AppState>>, app: &gtk4::Application, ws_id: u64) {
     // Cannot close the last workspace.
-    let (active_index, workspace_count) = {
-        let s = state.borrow();
-        (s.active_index, s.workspaces.len())
-    };
-    if workspace_count <= 1 {
+    if state.borrow().workspaces.len() <= 1 {
         return; // No-op: cannot close the last workspace
     }
 
@@ -209,13 +213,12 @@ pub fn handle_close_workspace(state: &Rc<RefCell<AppState>>, app: &gtk4::Applica
 
     let window = app.windows().into_iter().next();
 
-    dialog.choose(window.as_ref(), None::<&gtk4::gio::Cancellable>, {
-        let state = state.clone();
-        move |result| {
-            // Button index 1 = "Close Workspace" (destructive)
-            if let Ok(1) = result {
-                state.borrow_mut().close_workspace(active_index);
-            }
+    dialog.choose(window.as_ref(), None::<&gtk4::gio::Cancellable>, move |result| {
+        // Button index 1 = "Close Workspace" (destructive)
+        if let Ok(1) = result {
+            defer(move |s| {
+                s.close_workspace_by_id(ws_id);
+            });
         }
     });
 }
@@ -235,7 +238,7 @@ pub fn handle_split(state: &Rc<RefCell<AppState>>, vertical: bool) {
 }
 
 /// Close the active pane (Ctrl+Shift+W). The last pane of a tab closes the tab; AppState handles that.
-pub fn handle_close_pane(state: &Rc<RefCell<AppState>>, _app: &gtk4::Application) {
+pub fn handle_close_pane(state: &Rc<RefCell<AppState>>) {
     let active_pane = state.borrow().active_split_engine().map(|e| e.active_pane_id);
     if let Some(pane_id) = active_pane {
         state.borrow_mut().close_pane(pane_id);
@@ -243,8 +246,9 @@ pub fn handle_close_pane(state: &Rc<RefCell<AppState>>, _app: &gtk4::Application
 }
 
 /// Open the SSH connect dialog (Ctrl+Shift+S).
-pub fn handle_new_ssh_workspace(state: &Rc<RefCell<AppState>>, app: &gtk4::Application) {
-    crate::ssh_dialog::show_ssh_dialog(app, state.clone());
+pub fn handle_new_ssh_workspace(state: &Rc<RefCell<AppState>>) {
+    let app = state.borrow().gtk_app.clone();
+    crate::ssh_dialog::show_ssh_dialog(&app);
 }
 
 /// Move focus to adjacent pane in `direction`.
@@ -267,14 +271,14 @@ pub fn handle_browser_open(state: &Rc<RefCell<AppState>>) {
         }
         let bm = s.browser_manager.as_mut().unwrap();
         if let Err(e) = bm.ensure_daemon() {
-            eprintln!("cmux: browser.open failed to start daemon: {e}");
+            cmux_warn!("browser.open failed to start daemon: {e}");
             return;
         }
         // Enable WebSocket stream server, launch Chrome, navigate, start screencast
         let _ = bm.send_command("stream_enable", serde_json::json!({}));
         let _ = bm.send_command("launch", serde_json::json!({"headless": true}));
         if let Err(e) = bm.send_command("navigate", serde_json::json!({"url": "about:blank"})) {
-            eprintln!("cmux: browser.open navigate failed: {e}");
+            cmux_warn!("browser.open navigate failed: {e}");
             return;
         }
         let _ = bm.send_command("screencast_start", serde_json::json!({"format": "jpeg", "quality": 80}));
@@ -304,7 +308,7 @@ pub fn handle_browser_open(state: &Rc<RefCell<AppState>>) {
         let bm = s.browser_manager.as_mut().unwrap();
         if let Some(ref rt) = runtime {
             if let Err(e) = bm.start_stream(rt, picture) {
-                eprintln!("cmux: browser start_stream failed: {e}");
+                cmux_warn!("browser start_stream failed: {e}");
             }
         }
     } // drop borrow
