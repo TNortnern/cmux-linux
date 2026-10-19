@@ -458,10 +458,6 @@ impl SplitEngine {
         }
     }
 
-    /// No-op. Surfaces are recorded in each leaf's handle by the GLArea realize callback, so
-    /// there is nothing to sync from the registry. Kept only because main.rs still calls it.
-    pub fn sync_surfaces_from_registry(&mut self) {}
-
     /// Current working directory of the focused pane: the folder its shell reported (OSC 7),
     /// else what /proc shows for its shell. None if neither is known.
     pub fn focused_cwd(&self) -> Option<std::path::PathBuf> {
@@ -478,7 +474,6 @@ impl SplitEngine {
 
     /// Stops (`false`) or resumes (`true`) rendering of every pane in this engine. A hidden
     /// tab calls this with `false` so Ghostty stops drawing its panes; showing again refreshes them.
-    #[allow(dead_code)] // Stage 2: called once the tab package wires it up.
     pub fn set_visible(&self, visible: bool) {
         let mut surfaces = Vec::new();
         collect_surfaces(&self.root, &mut surfaces);
@@ -1085,8 +1080,6 @@ impl SplitEngine {
     pub fn gl_area_for_pane(&self, pane_id: u64) -> Option<gtk4::GLArea> {
         find_gl_area_in_tree(&self.root, pane_id)
     }
-
-    pub fn set_visible(&self, _visible: bool) {}
 }
 
 // ── Tree traversal helpers ───────────────────────────────────────────────────

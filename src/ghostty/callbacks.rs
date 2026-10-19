@@ -137,9 +137,7 @@ pub unsafe extern "C" fn action_cb(
                         }
                     }
                     // Session save belongs on the main thread (the save itself is debounced).
-                    glib::idle_add_once(|| {
-                        // T1: crate::app_state::request_session_save();
-                    });
+                    glib::idle_add_once(crate::app_state::request_session_save);
                 }
             }
         }
