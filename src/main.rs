@@ -595,13 +595,8 @@ fn handle_ssh_event(event: crate::ssh::SshEvent, state: &crate::app_state::AppSt
             }
         }
         crate::ssh::SshEvent::ClosePaneRequest { pane_id } => {
-            // Find the workspace containing this pane and close it
-            let ws_index = state.borrow().workspaces.iter().position(|ws| {
-                ws.id * 1000 == pane_id
-            });
-            if let Some(idx) = ws_index {
-                state.borrow_mut().close_workspace(idx);
-            }
+            // Pane ids are process-global; close just that pane (its workspace closes if it was the last one).
+            state.borrow_mut().close_pane(pane_id);
         }
         crate::ssh::SshEvent::StreamOpened { pane_id, stream_id } => {
             // Set the stream_id on the IoWriteContext so keystrokes start flowing
