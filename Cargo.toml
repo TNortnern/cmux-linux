@@ -37,6 +37,10 @@ clap_mangen = "0.3"
 name = "cmux-generate"
 path = "src/bin/generate.rs"
 
+[dev-dependencies]
+# #[tokio::test] only; the app itself builds without tokio's macros.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 [build-dependencies]
 bindgen = "0.72.1"
 cc = "1.2.57"
