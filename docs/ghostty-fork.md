@@ -27,7 +27,7 @@ Two commits sit on top of the upstream base:
 In the submodule:
 
 ```sh
-zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
+zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline -fsys=freetype
 ```
 
 This produces `zig-out/lib/libghostty.a` plus the `libghostty-dep-*.a` archives.

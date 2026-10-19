@@ -6,6 +6,10 @@
 //! `--exclude-libs,ALL` keeps those static symbols out of the executable's dynamic symbol
 //! table, so GTK/Pango keep using the system freetype/harfbuzz instead of ours.
 //!
+//! FreeType must be the SYSTEM library: fontconfig (always the system one) is handed FT_Face
+//! objects created by ghostty, so a second, vendored FreeType in the process corrupts the heap
+//! (crashes in FT_Done_Face). Any vendored FreeType archive is therefore never linked.
+//!
 //! glslang, SPIRV-Cross and Dear ImGui are C++ libraries that Zig compiles against LLVM's
 //! libc++, which would mean shipping a second C++ runtime. They only power custom GLSL
 //! shaders and the terminal inspector, so we skip them and link no-op stubs (stubs.c).
@@ -45,7 +49,9 @@ fn main() {
     // Identify the libc++-dependent libraries by content, not position, so a ghostty update
     // that reorders its dependency list can't silently change what we link.
     deps.retain(|p| !archive_members(p).iter().any(|m| {
-        ["glslang", "spirv_cross", "imgui", "CodeGen.o"].iter().any(|skip| m.contains(skip))
+        ["glslang", "spirv_cross", "imgui", "CodeGen.o", "ftbase.o", "ftsystem.o"]
+            .iter()
+            .any(|skip| m.contains(skip))
     }));
     if deps.is_empty() {
         panic!("no libghostty-dep-*.a in {}: the ghostty submodule must be our fork (TNortnern/ghostty)", lib_dir.display());
@@ -74,7 +80,7 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,--end-group");
 
     // System libraries libghostty needs dynamically.
-    for lib in ["fontconfig", "GL", "stdc++"] {
+    for lib in ["fontconfig", "freetype", "GL", "stdc++"] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
 

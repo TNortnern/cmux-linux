@@ -100,10 +100,15 @@ build_libghostty() {
     echo "==> Building libghostty (this takes a few minutes the first time)"
     (
         cd ghostty
+        # Stale dependency archives from an earlier configuration must not be linked.
+        rm -f zig-out/lib/libghostty-dep-*.a
+        # -fsys=freetype: one FreeType per process. fontconfig is always the system library and
+        # receives ghostty's FT_Face objects; a second, vendored FreeType corrupts the heap.
         zig build \
             -Dapp-runtime=none \
             -Doptimize=ReleaseFast \
-            -Dcpu=baseline
+            -Dcpu=baseline \
+            -fsys=freetype
     )
 
     local lib_dir="ghostty/zig-out/lib"
