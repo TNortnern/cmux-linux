@@ -1,6 +1,9 @@
+use crate::ghostty::cwd::{new_track, validate_cwd, PaneTrackCell};
 use crate::ghostty::ffi;
 use gtk4::glib;
 use std::cell::RefCell;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::rc::Rc;
 
 /// I/O mode for a Ghostty surface.
@@ -26,6 +29,13 @@ pub struct PaneCtx {
     pub surface: SurfaceCell,
     /// Weak, so the context never keeps the GLArea alive.
     pub gl_area: glib::WeakRef<gtk4::GLArea>,
+    /// The pane's tracked folder and shell pid. Shared with the Ghostty action callback.
+    pub track: PaneTrackCell,
+    /// Start folder for `working_directory`. Ghostty copies it in `ghostty_surface_new`, which
+    /// runs at realize, so it must stay alive until then (and it stays here until teardown).
+    initial_cwd: Option<CString>,
+    /// Environment for the shell, e.g. `CMUX_PANE_ID=<id>`. Copied by Ghostty at realize.
+    env: Vec<(CString, CString)>,
 }
 
 /// Owned handles for one new pane, returned by `create_surface`.
@@ -34,6 +44,8 @@ pub struct PaneSurface {
     pub surface: SurfaceCell,
     /// Heap `PaneCtx` owned by the pane. Freed by `teardown_pane`.
     pub ctx: *mut PaneCtx,
+    /// Same track as `PaneCtx::track`, for the split tree's leaf.
+    pub track: PaneTrackCell,
 }
 
 /// Empty NUL-terminated string, used to deny a clipboard request.
@@ -111,8 +123,8 @@ pub fn create_surface(
     pane_id: u64,
     io_mode: SurfaceIoMode,
     // Start the shell in this folder (new tab/split in the current folder, session restore).
-    // STUB: ignored until package T2 wires it into ghostty's working_directory.
-    _cwd: Option<std::path::PathBuf>,
+    // Anything but an existing absolute directory is ignored: the shell starts in the default folder.
+    cwd: Option<std::path::PathBuf>,
 ) -> PaneSurface {
     use gtk4::prelude::*;
 
@@ -123,6 +135,20 @@ pub fn create_surface(
         pane_id,
         inherited_config.is_some()
     );
+
+    let initial_cwd = cwd
+        .as_deref()
+        .and_then(validate_cwd)
+        .and_then(|path| CString::new(path.as_os_str().as_bytes()).ok());
+    // Tags the shell so /proc lookup can find it when shell integration is absent.
+    let env = vec![(
+        CString::new(crate::ghostty::cwd::PANE_ID_ENV).expect("no NUL in the variable name"),
+        CString::new(pane_id.to_string()).expect("digits have no NUL"),
+    )];
+    let track = new_track();
+    if let (SurfaceIoMode::Manual { .. }, Ok(mut t)) = (&io_mode, track.lock()) {
+        t.remote = true;
+    }
 
     let gl_area = gtk4::GLArea::new();
     // Per Pitfall 1: require OpenGL 4.3 before the area is realized.
@@ -150,6 +176,9 @@ pub fn create_surface(
         pane_id,
         surface: surface_cell.clone(),
         gl_area: gl_area.downgrade(),
+        track: track.clone(),
+        initial_cwd,
+        env,
     }));
 
     // ── GtkGLArea::realize ───────────────────────────────────────────────────
@@ -209,6 +238,24 @@ pub fn create_surface(
             }
 
             // Create the ghostty surface now that GL context is current.
+            // The folder and env strings live in PaneCtx; these arrays only need to outlive
+            // ghostty_surface_new, which copies them.
+            let ctx_ref = unsafe { pane_ctx(ctx as *mut std::ffi::c_void) };
+            let mut env_vars: Vec<ffi::ghostty_env_var_s> = ctx_ref
+                .map(|c| {
+                    c.env
+                        .iter()
+                        .map(|(k, v)| ffi::ghostty_env_var_s {
+                            key: k.as_ptr(),
+                            value: v.as_ptr(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cwd_ptr = ctx_ref
+                .and_then(|c| c.initial_cwd.as_ref())
+                .map_or(std::ptr::null(), |c| c.as_ptr());
+
             let surface = unsafe {
                 let gl_area_ptr = area.as_ptr() as *mut std::ffi::c_void;
 
@@ -229,6 +276,11 @@ pub fn create_surface(
                 // Surface callbacks (clipboard, close) receive this pointer as userdata.
                 surface_config.userdata = ctx as *mut std::ffi::c_void;
                 surface_config.scale_factor = area.scale_factor() as f64;
+                // cmux's tracked folder is the source of truth, so this replaces any
+                // working_directory carried by an inherited config (null = Ghostty's default).
+                surface_config.working_directory = cwd_ptr;
+                surface_config.env_vars = env_vars.as_mut_ptr();
+                surface_config.env_var_count = env_vars.len();
 
                 // Set manual I/O mode for SSH remote surfaces.
                 if let SurfaceIoMode::Manual { ref io_write_ctx } = io_mode {
@@ -624,6 +676,7 @@ pub fn create_surface(
         gl_area,
         surface: surface_cell,
         ctx,
+        track,
     }
 }
 
