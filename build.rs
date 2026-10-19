@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let ghostty = manifest_dir.join("ghostty");
+    // CMUX_GHOSTTY_DIR lets worktrees and CI reuse one prebuilt ghostty checkout.
+    let ghostty = env::var_os("CMUX_GHOSTTY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.join("ghostty"));
     let lib_dir = ghostty.join("zig-out/lib");
     let header = ghostty.join("include/ghostty.h");
 
@@ -78,6 +81,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", libghostty.display());
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CMUX_GHOSTTY_DIR");
     println!("cargo:rerun-if-changed=stubs.c");
 
     let bindings = bindgen::Builder::default()
