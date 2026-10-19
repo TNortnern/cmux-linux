@@ -1,10 +1,12 @@
-[workspace]
-members = [".", "agent-browser/cli"]
-
 [package]
 name = "cmux-linux"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "GPU-accelerated terminal multiplexer for Linux (GTK4 + Ghostty)"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/TNortnern/cmux-linux"
+readme = "README.md"
+publish = false
 
 [[bin]]
 name = "cmux-app"
@@ -37,3 +39,9 @@ path = "src/bin/generate.rs"
 [build-dependencies]
 bindgen = "0.72.1"
 cc = "1.2.57"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+debug = "line-tables-only"

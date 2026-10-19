@@ -57,3 +57,9 @@ tmp-*/
 dist/
 daemon/remote/cmuxd-remote
 found
+
+# build outputs and local logs
+/target/
+*.log
+*.o
+.claude/worktrees/

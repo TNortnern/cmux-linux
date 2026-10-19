@@ -1,152 +1,88 @@
+//! Links libghostty (built by scripts/setup-linux.sh into ghostty/zig-out) and generates
+//! Rust bindings from the submodule's own header, so the header always matches the library.
+//!
+//! Everything links statically from source: libghostty.a, its vendored C/C++ dependencies
+//! (installed by our ghostty fork as zig-out/lib/libghostty-dep-*.a), and the GLAD loader.
+//! `--exclude-libs,ALL` keeps those static symbols out of the executable's dynamic symbol
+//! table, so GTK/Pango keep using the system freetype/harfbuzz instead of ours.
+//!
+//! glslang, SPIRV-Cross and Dear ImGui are C++ libraries that Zig compiles against LLVM's
+//! libc++, which would mean shipping a second C++ runtime. They only power custom GLSL
+//! shaders and the terminal inspector, so we skip them and link no-op stubs (stubs.c).
+
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
-    // Get the absolute path to the project directory
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let ghostty_lib_path = format!("{}/ghostty/zig-out/lib", manifest_dir);
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let ghostty = manifest_dir.join("ghostty");
+    let lib_dir = ghostty.join("zig-out/lib");
+    let header = ghostty.join("include/ghostty.h");
 
-    // Static link pre-built libghostty.a (built by scripts/setup-linux.sh)
-    // Use absolute path to ensure it's found
-    println!("cargo:rustc-link-search=native={}", ghostty_lib_path);
-    println!("cargo:rustc-link-lib=static=ghostty");
-
-    // Link simdutf object file that ghostty depends on.
-    // Find the most recent simdutf.o in zig-cache (hash changes on rebuild).
-    let zig_cache = format!("{}/ghostty/.zig-cache/o", manifest_dir);
-    if let Ok(entries) = std::fs::read_dir(&zig_cache) {
-        let mut simdutf_path = None;
-        let mut newest_mtime = std::time::SystemTime::UNIX_EPOCH;
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("simdutf.o");
-            if candidate.exists() {
-                if let Ok(meta) = candidate.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        if mtime > newest_mtime {
-                            newest_mtime = mtime;
-                            simdutf_path = Some(candidate);
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(path) = simdutf_path {
-            println!("cargo:rustc-link-arg={}", path.display());
-        }
+    let libghostty = lib_dir.join("libghostty.a");
+    if !libghostty.exists() {
+        panic!(
+            "{} not found: run scripts/setup-linux.sh first (builds libghostty with Zig)",
+            libghostty.display()
+        );
     }
 
-    // Link Highway SIMD library that libghostty depends on (for runtime CPU dispatch)
-    // Find the most recent libhighway.a in zig-cache
-    let zig_cache = format!("{}/ghostty/.zig-cache/o", manifest_dir);
-    if let Ok(entries) = std::fs::read_dir(&zig_cache) {
-        let mut highway_path = None;
-        let mut newest_mtime = std::time::SystemTime::UNIX_EPOCH;
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("libhighway.a");
-            if candidate.exists() {
-                if let Ok(meta) = candidate.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        if mtime > newest_mtime {
-                            newest_mtime = mtime;
-                            highway_path = Some(candidate);
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(path) = highway_path {
-            println!("cargo:rustc-link-search=native={}", path.parent().unwrap().display());
-            println!("cargo:rustc-link-lib=static=highway");
-        }
+    // Vendored deps, in a stable order (libghostty-dep-0.a, -1, ... -10).
+    let mut deps: Vec<PathBuf> = std::fs::read_dir(&lib_dir)
+        .expect("read ghostty/zig-out/lib")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libghostty-dep-") && n.ends_with(".a"))
+        })
+        .collect();
+    deps.sort_by_key(|p| dep_index(p));
+    // Identify the libc++-dependent libraries by content, not position, so a ghostty update
+    // that reorders its dependency list can't silently change what we link.
+    deps.retain(|p| !archive_members(p).iter().any(|m| {
+        ["glslang", "spirv_cross", "imgui", "CodeGen.o"].iter().any(|skip| m.contains(skip))
+    }));
+    if deps.is_empty() {
+        panic!("no libghostty-dep-*.a in {}: the ghostty submodule must be our fork (TNortnern/ghostty)", lib_dir.display());
     }
 
-    // Link stub object file to satisfy undefined symbols from missing libraries (use absolute path)
-    println!("cargo:rustc-link-arg={}/stubs.o", manifest_dir);
+    // GLAD (OpenGL loader) from ghostty's vendored copy; libghostty expects the host to provide it.
+    cc::Build::new()
+        .file(ghostty.join("vendor/glad/src/gl.c"))
+        .include(ghostty.join("vendor/glad/include"))
+        .warnings(false)
+        .compile("cmux_glad");
 
-    // Link the GLAD loader object file — provides gladLoaderLoadGLContext and
-    // gladLoaderUnloadGLContext which are needed by ghostty's OpenGL renderer.
-    println!("cargo:rustc-link-arg={}/glad.o", manifest_dir);
+    // No-op glslang/SPIRV-Cross/ImGui symbols referenced by libghostty (see module docs).
+    cc::Build::new()
+        .file(manifest_dir.join("stubs.c"))
+        .warnings(false)
+        .compile("cmux_stubs");
 
-    // Rebuild if the glad source changes
-    println!("cargo:rerun-if-changed=ghostty/vendor/glad/src/gl.c");
-    println!("cargo:rerun-if-changed=ghostty/vendor/glad/include/glad/gl.h");
+    // A group lets the deps reference each other regardless of order.
+    println!("cargo:rustc-link-arg=-Wl,--exclude-libs,ALL");
+    println!("cargo:rustc-link-arg=-Wl,--start-group");
+    println!("cargo:rustc-link-arg={}", libghostty.display());
+    for dep in &deps {
+        println!("cargo:rustc-link-arg={}", dep.display());
+    }
+    println!("cargo:rustc-link-arg=-Wl,--end-group");
 
-    // libghostty.a requires these system libraries at link time
-    println!("cargo:rustc-link-lib=dylib=GL");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-    println!("cargo:rustc-link-lib=dylib=gcc_s"); // For __gxx_personality_v0
-    println!("cargo:rustc-link-lib=dylib=fontconfig");
-    println!("cargo:rustc-link-lib=dylib=freetype");
-
-    // Try to link the versioned onig library if dev package isn't installed
-    if std::process::Command::new("pkg-config")
-        .args(["--exists", "oniguruma"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        println!("cargo:rustc-link-lib=dylib=onig");
-    } else if std::path::Path::new("/usr/lib/x86_64-linux-gnu/libonig.so.5").exists() {
-        // Link to the versioned library file directly
-        println!("cargo:rustc-link-arg=/usr/lib/x86_64-linux-gnu/libonig.so.5");
+    // System libraries libghostty needs dynamically.
+    for lib in ["fontconfig", "GL", "stdc++"] {
+        println!("cargo:rustc-link-lib=dylib={lib}");
     }
 
-    // glslang is optional - ghostty can work without it
-    // We'll skip it for now since it's not installed
-
-    // Use pkg-config for GTK4/GLib system libraries that libghostty.a needs
-    // at link time if they are not fully bundled in the static archive.
-    // This is a soft best-effort; link errors reveal which ones are needed.
-    if std::process::Command::new("pkg-config")
-        .args(["--exists", "gtk4"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        // Emit link-search dirs from the .pc file location (handles extracted dev packages).
-        // pkg-config --variable=pcfiledir emits the directory containing the .pc file; the
-        // sibling directory (../lib or the pkgconfig parent) contains the .so linker stubs.
-        for pkg in &["gtk4", "graphene-gobject-1.0"] {
-            let pcdir_out = std::process::Command::new("pkg-config")
-                .args(["--variable=pcfiledir", pkg])
-                .output();
-            if let Ok(out) = pcdir_out {
-                let pcdir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !pcdir.is_empty() {
-                    // pkgconfig dir is typically .../lib/x86_64-linux-gnu/pkgconfig;
-                    // the parent contains the .so symlinks.
-                    let libdir = std::path::Path::new(&pcdir)
-                        .parent()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    if !libdir.is_empty() {
-                        println!("cargo:rustc-link-search=native={libdir}");
-                    }
-                }
-            }
-        }
-
-        let gtk4_libs = std::process::Command::new("pkg-config")
-            .args(["--libs", "gtk4"])
-            .output()
-            .expect("pkg-config gtk4 failed");
-        let flags = String::from_utf8_lossy(&gtk4_libs.stdout);
-        for flag in flags.split_whitespace() {
-            if let Some(lib) = flag.strip_prefix("-l") {
-                println!("cargo:rustc-link-lib=dylib={lib}");
-            } else if let Some(path) = flag.strip_prefix("-L") {
-                println!("cargo:rustc-link-search=native={path}");
-            }
-        }
-    }
-
-    // Re-run bindgen when ghostty.h changes (Plan 02 already patched it)
-    println!("cargo:rerun-if-changed=ghostty.h");
+    println!("cargo:rerun-if-changed={}", libghostty.display());
+    println!("cargo:rerun-if-changed={}", header.display());
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=stubs.c");
 
     let bindings = bindgen::Builder::default()
-        .header("ghostty.h")
+        .header(header.to_string_lossy())
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        // Needed for types that reference C integer types
         .allowlist_item("ghostty_.*")
         .allowlist_item("GHOSTTY_.*")
         .generate()
@@ -156,4 +92,21 @@ fn main() {
     bindings
         .write_to_file(out_path.join("ghostty_sys.rs"))
         .expect("Couldn't write ghostty_sys.rs");
+}
+
+fn archive_members(path: &Path) -> Vec<String> {
+    let out = std::process::Command::new("ar")
+        .arg("t")
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| panic!("running `ar t {}`: {e}", path.display()));
+    String::from_utf8_lossy(&out.stdout).lines().map(str::to_owned).collect()
+}
+
+fn dep_index(path: &Path) -> u32 {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("libghostty-dep-"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u32::MAX)
 }
