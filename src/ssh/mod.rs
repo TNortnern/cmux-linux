@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod deploy;
+pub mod target;
 pub mod tunnel;
 
 use crate::workspace::ConnectionState;

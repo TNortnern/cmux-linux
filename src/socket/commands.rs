@@ -47,6 +47,8 @@ pub enum SocketCommand {
 
     // -- debug.* --
     DebugLayout      { req_id: Value, resp_tx: RespTx },
+    /// Injects text into the active surface; debug builds only.
+    #[cfg(debug_assertions)]
     DebugType        { req_id: Value, text: String, resp_tx: RespTx },
 
     // -- notification.* (Phase 4: NOTF-01, NOTF-02) --

@@ -401,7 +401,7 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
     // Use longer timeout for browser wait commands
     let timeout = match &cli.command {
         Commands::Browser(BrowserCommand::Wait { timeout_ms, .. }) => {
-            Duration::from_millis(timeout_ms + 5000)
+            Duration::from_millis(timeout_ms.saturating_add(5000))
         }
         _ => Duration::from_secs(5),
     };

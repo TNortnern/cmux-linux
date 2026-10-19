@@ -1,12 +1,12 @@
 use base64::Engine;
-use crate::ssh::bridge::{SshBridge, WriteRequest};
+use crate::ssh::bridge::SshBridge;
 use crate::ssh::{SshEvent, SshEventTx};
 use crate::workspace::ConnectionState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::oneshot;
 
 /// Maximum reconnection backoff delay.
@@ -32,6 +32,16 @@ pub async fn run_ssh_lifecycle(
     ssh_tx: SshEventTx,
     bridge: Arc<SshBridge>,
 ) {
+    // Every entry point validates too; this guards the ssh/scp argv against option injection.
+    if let Err(e) = crate::ssh::target::validate_target(&target) {
+        eprintln!("cmux: refusing SSH target: {e}");
+        let _ = ssh_tx.send(SshEvent::StateChanged {
+            workspace_id,
+            state: ConnectionState::Disconnected,
+        });
+        return;
+    }
+
     let mut attempt: u32 = 0;
 
     loop {
@@ -109,7 +119,10 @@ pub async fn run_ssh_lifecycle(
                             line.clear();
                             match buf.read_line(&mut line).await {
                                 Ok(0) => break,
-                                Ok(_) => eprintln!("cmux: SSH stderr: {}", line.trim_end()),
+                                Ok(_) => eprintln!(
+                                    "cmux: SSH stderr: {}",
+                                    sanitize_remote_text(line.trim_end())
+                                ),
                                 Err(_) => break,
                             }
                         }
@@ -450,23 +463,26 @@ pub async fn open_remote_stream(
     Ok(stream_id)
 }
 
+/// Strip ASCII control characters (except newline and tab) from text that came from
+/// the remote side, so it cannot inject terminal escape sequences into our stderr.
+fn sanitize_remote_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_ascii_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
 /// Start an SSH process with cmuxd-remote in stdio mode.
 async fn start_ssh(target: &str) -> Result<Child, String> {
-    let child = Command::new("ssh")
+    let child = crate::ssh::deploy::ssh_base("ssh")
         .args([
             "-o",
             "ServerAliveInterval=15",
             "-o",
             "ServerAliveCountMax=3",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "BatchMode=yes",
-            target,
-            ".local/bin/cmuxd-remote",
-            "serve",
-            "--stdio",
         ])
+        .arg("--")
+        .arg(target)
+        .args([".local/bin/cmuxd-remote", "serve", "--stdio"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -490,6 +506,13 @@ mod tests {
     fn test_max_retries_is_reasonable() {
         assert!(MAX_RETRIES >= 5, "too few retries");
         assert!(MAX_RETRIES <= 20, "too many retries");
+    }
+
+    #[test]
+    fn test_sanitize_remote_text_strips_escapes() {
+        assert_eq!(sanitize_remote_text("ok\x1b[2Jbad\r"), "ok[2Jbad");
+        assert_eq!(sanitize_remote_text("a\tb\nc\x07"), "a\tb\nc");
+        assert_eq!(sanitize_remote_text("plain text"), "plain text");
     }
 
     #[test]

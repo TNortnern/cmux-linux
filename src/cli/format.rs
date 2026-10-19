@@ -88,7 +88,7 @@ pub fn format_surface_list(result: &Value, color: bool) -> String {
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let id_short = &id[..id.len().min(8)];
+        let id_short = short_id(id);
         let title = surface
             .get("title")
             .and_then(|v| v.as_str())
@@ -127,7 +127,7 @@ pub fn format_pane_list(result: &Value, color: bool) -> String {
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let id_short = &id[..id.len().min(8)];
+        let id_short = short_id(id);
         let title = pane.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let marker = if focused { "*" } else { " " };
         let line = if title.is_empty() {
@@ -217,7 +217,7 @@ fn format_notification_list(result: &Value, color: bool) -> String {
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let id_short = &id[..id.len().min(8)];
+        let id_short = short_id(id);
         let attention = n
             .get("attention")
             .and_then(|v| v.as_bool())
@@ -354,4 +354,23 @@ pub fn format_browser_list(result: &Value, _color: bool) -> String {
 /// Fallback: pretty-print JSON.
 fn format_fallback(result: &Value) -> String {
     serde_json::to_string_pretty(result).unwrap_or_default()
+}
+
+/// First 8 characters of an id for display. Counts chars, not bytes, so short or
+/// non-ASCII ids cannot cause a slice panic.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_id_handles_short_and_non_ascii_ids() {
+        assert_eq!(short_id("abc"), "abc");
+        assert_eq!(short_id(""), "");
+        assert_eq!(short_id("0123456789abcdef"), "01234567");
+        assert_eq!(short_id("éèàüöäß∑∆πΩ≈"), "éèàüöäß∑");
+    }
 }
