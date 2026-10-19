@@ -1,8 +1,8 @@
 use crate::ghostty::cwd::{self, PaneTrackCell};
 use crate::ghostty::ffi;
-use crate::ghostty::surface::{teardown_pane, PaneCtx, PaneSurface, SurfaceCell};
+use crate::ghostty::surface::{teardown_pane, with_pane_ctx, CtxCell, PaneSurface, SurfaceCell};
 use gtk4::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
@@ -51,7 +51,7 @@ pub enum SplitNode {
         /// teardown. Read the surface only through this handle.
         surface: SurfaceCell,
         /// Per-pane context shared with Ghostty as surface userdata. Freed by teardown_pane.
-        ctx: *mut PaneCtx,
+        ctx: CtxCell,
         /// The pane's tracked folder and shell pid (same cell as `ctx.track`).
         track: PaneTrackCell,
         /// Stable UUID for session persistence and v2 socket protocol pane identity.
@@ -382,7 +382,7 @@ impl SplitEngine {
         depth: u32,
     ) -> Option<SplitNode> {
         if depth > 16 {
-            eprintln!("cmux: session restore tree depth > 16, falling back (D-14)");
+            cmux_warn!("session restore tree depth > 16, falling back (D-14)");
             return None;
         }
         match data {
@@ -474,14 +474,18 @@ impl SplitEngine {
 
     /// Stops (`false`) or resumes (`true`) rendering of every pane in this engine. A hidden
     /// tab calls this with `false` so Ghostty stops drawing its panes; showing again refreshes them.
+    /// Every pane records the state, realized or not, so a pane realized later starts in it.
     pub fn set_visible(&self, visible: bool) {
-        let mut surfaces = Vec::new();
-        collect_surfaces(&self.root, &mut surfaces);
-        for surface in surfaces {
-            unsafe {
-                ffi::ghostty_surface_set_occlusion(surface, visible);
-                if visible {
-                    ffi::ghostty_surface_refresh(surface);
+        let mut leaves = Vec::new();
+        collect_leaf_handles(&self.root, &mut leaves);
+        for (surface_cell, ctx_cell) in leaves {
+            with_pane_ctx(&ctx_cell, |ctx| ctx.visible.set(visible));
+            if let Some(surface) = *surface_cell.borrow() {
+                unsafe {
+                    ffi::ghostty_surface_set_occlusion(surface, visible);
+                    if visible {
+                        ffi::ghostty_surface_refresh(surface);
+                    }
                 }
             }
         }
@@ -489,7 +493,6 @@ impl SplitEngine {
 
     /// Grows the active pane toward `direction` by `step_px`, by moving the nearest divider
     /// with the matching orientation. Returns true if a divider moved. Un-zooms first.
-    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
     pub fn resize_active(&mut self, direction: FocusDirection, step_px: i32) -> bool {
         if step_px <= 0 {
             return false;
@@ -500,7 +503,6 @@ impl SplitEngine {
 
     /// Sets every divider to its leaf-count weighted position (left leaves / total leaves).
     /// Un-zooms first.
-    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
     pub fn equalize(&mut self) {
         self.unzoom();
         equalize_node(&self.root);
@@ -508,7 +510,6 @@ impl SplitEngine {
 
     /// Shows only the active pane (hides the other branches), or restores the layout when
     /// already zoomed. Returns true if the zoom state changed; false with nothing to zoom.
-    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
     pub fn toggle_zoom(&mut self) -> bool {
         if self.is_zoomed() {
             self.unzoom();
@@ -518,9 +519,48 @@ impl SplitEngine {
         self.apply_zoom(rects)
     }
 
-    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
     pub fn is_zoomed(&self) -> bool {
         self.zoom.is_some()
+    }
+
+    /// Makes `pane_id` the active pane: GTK focus, Ghostty focus and the active-pane CSS move
+    /// together, the same way keyboard focus moves. Returns false if the pane is not in this tab.
+    /// Un-zooms first, so the pane is visible.
+    pub fn focus_pane(&mut self, pane_id: u64) -> bool {
+        if !self.contains_pane(pane_id) {
+            return false;
+        }
+        self.unzoom();
+        let old = self.active_pane_id;
+        if old != pane_id {
+            if let Some(old_surface) = self.find_surface(old) {
+                unsafe {
+                    ffi::ghostty_surface_set_focus(old_surface, false);
+                }
+            }
+        }
+        self.active_pane_id = pane_id;
+        self.root.update_focus_css(pane_id);
+        if let Some(surface) = self.find_surface(pane_id) {
+            unsafe {
+                ffi::ghostty_surface_set_focus(surface, true);
+            }
+        }
+        if let Some(gl_area) = self.find_gl_area(pane_id) {
+            gl_area.grab_focus();
+        } else if let Some(entry) = find_url_entry_in_tree(&self.root, pane_id) {
+            entry.grab_focus();
+        }
+        true
+    }
+
+    /// Focuses the next pane of this tab in tree order, wrapping from the last to the first.
+    /// Returns the pane that is active afterwards.
+    pub fn focus_next_pane(&mut self) -> Option<u64> {
+        let mut ids = Vec::new();
+        collect_leaves_in_order(&self.root, &mut ids);
+        let next = next_pane_in_order(&ids, self.active_pane_id)?;
+        self.focus_pane(next).then_some(next)
     }
 
     /// Hides every branch on the path to the active pane. Returns false if nothing was hidden.
@@ -555,7 +595,6 @@ impl SplitEngine {
     }
 
     /// Splits the active pane along its longer side: side by side when it is wider than tall.
-    #[allow(dead_code)] // Stage 2: called once the keymap package wires it up.
     pub fn split_auto(&mut self) -> Option<u64> {
         let orientation = match self.gl_area_for_pane(self.active_pane_id) {
             Some(area) => auto_split_orientation(area.width(), area.height()),
@@ -591,13 +630,9 @@ impl SplitEngine {
             }
         }
         // Kick the render loop to repaint after focus restore.
-        if let Ok(areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {
-            for area_ptr in areas.iter() {
-                let area: gtk4::glib::translate::Borrowed<gtk4::GLArea> =
-                    unsafe { gtk4::glib::translate::from_glib_borrow(area_ptr.0) };
-                if area.is_realized() {
-                    area.queue_render();
-                }
+        for area in crate::ghostty::callbacks::registered_gl_areas() {
+            if area.is_realized() {
+                area.queue_render();
             }
         }
     }
@@ -685,7 +720,7 @@ impl SplitEngine {
             has_attention: false,
         };
 
-        let _replaced = self.replace_leaf_with_split(active_id, new_leaf, orientation)?;
+        self.replace_leaf_with_split(active_id, new_leaf, orientation)?;
 
         // If the root was a Leaf, it's now a Split whose Paned has no parent.
         // Re-parent the new Paned root into the GtkStack page we saved above.
@@ -763,7 +798,7 @@ impl SplitEngine {
         };
 
         // Replace active leaf with Split(active_leaf, preview_node) -- vertical, preview on right
-        let _replaced = self.replace_leaf_with_split(
+        self.replace_leaf_with_split(
             active_id,
             preview_node,
             gtk4::Orientation::Horizontal, // Horizontal paned = side-by-side (left terminal, right preview)
@@ -899,7 +934,7 @@ impl SplitEngine {
                 }
 
                 if !found_gesture {
-                    eprintln!("cmux: WARNING — no GestureDrag found on Paned or its children, falling back to notify::position");
+                    cmux_warn!("no GestureDrag found on Paned or its children, falling back to notify::position");
                     // Fallback: use notify::position but debounced via idle.
                     // connect_notify requires Send+Sync, so use AtomicBool instead of Rc<Cell>.
                     let restore_pending =
@@ -949,7 +984,7 @@ impl SplitEngine {
 
         // Tear down the surface and GL state while the widget is still in the tree.
         if let Some(SplitNode::Leaf { gl_area, surface, ctx, .. }) = self.root.find_node(target_id) {
-            teardown_pane(gl_area, surface, *ctx);
+            teardown_pane(gl_area, surface, ctx);
         }
 
         // Remove the leaf from the tree and get the surviving sibling's pane_id.
@@ -981,16 +1016,6 @@ impl SplitEngine {
         }
 
         CloseResult::Closed(surviving_id)
-    }
-
-    /// Compatibility wrapper for callers written before `CloseResult`: `Some(new active pane)`
-    /// when the active pane closed, `None` for the last pane or a failure. Prefer `close_pane`,
-    /// which tells those two apart.
-    pub fn close_active(&mut self) -> Option<u64> {
-        match self.close_pane(self.active_pane_id) {
-            CloseResult::Closed(id) => Some(id),
-            CloseResult::LastPane | CloseResult::Failed => None,
-        }
     }
 
     /// Tears down every pane's surface and GL state. Call before the workspace's widgets are
@@ -1099,7 +1124,7 @@ where
                         pane_id: 0,
                         gl_area: gtk4::GLArea::new(),
                         surface: Rc::new(RefCell::new(None)),
-                        ctx: std::ptr::null_mut(),
+                        ctx: Rc::new(Cell::new(std::ptr::null_mut())),
                         track: cwd::new_track(),
                         uuid: Uuid::new_v4(),
                         has_attention: false,
@@ -1278,7 +1303,7 @@ fn count_terminals(node: &SplitNode) -> usize {
 /// Tears down every leaf's surface and GL state in a subtree. Each leaf is torn down once.
 fn teardown_leaves(node: &SplitNode) {
     match node {
-        SplitNode::Leaf { gl_area, surface, ctx, .. } => teardown_pane(gl_area, surface, *ctx),
+        SplitNode::Leaf { gl_area, surface, ctx, .. } => teardown_pane(gl_area, surface, ctx),
         SplitNode::Preview { .. } => {}
         SplitNode::Split { start, end, .. } => {
             teardown_leaves(start);
@@ -1496,15 +1521,23 @@ fn leaf_rects(root: &SplitNode) -> Option<Vec<(u64, Rect)>> {
         .collect()
 }
 
-fn collect_surfaces(node: &SplitNode, out: &mut Vec<ffi::ghostty_surface_t>) {
+/// The surface and context handles of every terminal leaf in a subtree.
+fn collect_leaf_handles(node: &SplitNode, out: &mut Vec<(SurfaceCell, CtxCell)>) {
     match node {
-        SplitNode::Leaf { surface, .. } => out.extend(*surface.borrow()),
+        SplitNode::Leaf { surface, ctx, .. } => out.push((surface.clone(), ctx.clone())),
         SplitNode::Preview { .. } => {}
         SplitNode::Split { start, end, .. } => {
-            collect_surfaces(start, out);
-            collect_surfaces(end, out);
+            collect_leaf_handles(start, out);
+            collect_leaf_handles(end, out);
         }
     }
+}
+
+/// The pane after `active` in `ids` (tree order), wrapping from the last pane to the first.
+/// None if `active` is not in `ids`.
+pub fn next_pane_in_order(ids: &[u64], active: u64) -> Option<u64> {
+    let pos = ids.iter().position(|&id| id == active)?;
+    Some(ids[(pos + 1) % ids.len()])
 }
 
 /// Find the pane adjacent to `active_id` in `direction` by tree order: Left/Up = previous leaf,
@@ -1566,29 +1599,28 @@ fn remove_widget_from_parent(widget: &gtk4::Widget) {
 /// so the guard `if cursor_c.state() != .active` sees `.active` and skips the
 /// restart. The cancel then completes, leaving the timer permanently dead.
 fn restore_active_pane_focus() {
-    // Re-set size + refresh ALL surfaces to break the anti-flicker stall.
-    if let Ok(areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {
-        if let Ok(gl_to_surface) = crate::ghostty::callbacks::GL_TO_SURFACE.lock() {
-            for area_ptr in areas.iter() {
-                let area: gtk4::glib::translate::Borrowed<gtk4::GLArea> =
-                    unsafe { gtk4::glib::translate::from_glib_borrow(area_ptr.0) };
-                if let Some(&surface_ptr) = gl_to_surface.get(&(area_ptr.0 as usize)) {
-                    let scale = area.scale_factor();
-                    let w = (area.width() * scale) as u32;
-                    let h = (area.height() * scale) as u32;
-                    if w > 0 && h > 0 {
-                        unsafe {
-                            let surface = surface_ptr as ffi::ghostty_surface_t;
-                            ffi::ghostty_surface_set_size(surface, w, h);
-                            ffi::ghostty_surface_refresh(surface);
-                        }
-                    }
-                }
-                if area.is_realized() {
-                    area.queue_render();
-                    area.queue_draw();
+    // Re-set size + refresh ALL surfaces to break the anti-flicker stall. The registries are
+    // copied first and no lock is held while Ghostty runs, since its calls can re-enter callbacks.
+    let surfaces_by_area = crate::ghostty::callbacks::GL_TO_SURFACE
+        .lock()
+        .map(|map| map.clone())
+        .unwrap_or_default();
+    for area in crate::ghostty::callbacks::registered_gl_areas() {
+        if let Some(&surface_ptr) = surfaces_by_area.get(&(area.as_ptr() as usize)) {
+            let scale = area.scale_factor();
+            let w = (area.width() * scale) as u32;
+            let h = (area.height() * scale) as u32;
+            if w > 0 && h > 0 {
+                unsafe {
+                    let surface = surface_ptr as ffi::ghostty_surface_t;
+                    ffi::ghostty_surface_set_size(surface, w, h);
+                    ffi::ghostty_surface_refresh(surface);
                 }
             }
+        }
+        if area.is_realized() {
+            area.queue_render();
+            area.queue_draw();
         }
     }
 
@@ -1602,16 +1634,12 @@ fn restore_active_pane_focus() {
     }
 
     // Restore GTK keyboard focus to the active pane.
-    if let Ok(areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {
-        for area_ptr in areas.iter() {
-            let area: gtk4::glib::translate::Borrowed<gtk4::GLArea> =
-                unsafe { gtk4::glib::translate::from_glib_borrow(area_ptr.0) };
-            if area.has_css_class("active-pane") {
-                area.grab_focus();
-                area.queue_render();
-                break;
-            }
-        }
+    let active_area = crate::ghostty::callbacks::registered_gl_areas()
+        .into_iter()
+        .find(|area| area.has_css_class("active-pane"));
+    if let Some(area) = active_area {
+        area.grab_focus();
+        area.queue_render();
     }
 
     // The set_size → IO thread → render thread → updateFrame → cells rebuild pipeline
@@ -1629,13 +1657,9 @@ fn restore_active_pane_focus() {
                         ffi::ghostty_app_tick(app_ptr as ffi::ghostty_app_t);
                     }
                 }
-                if let Ok(areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {
-                    for area_ptr in areas.iter() {
-                        let area: gtk4::glib::translate::Borrowed<gtk4::GLArea> =
-                            unsafe { gtk4::glib::translate::from_glib_borrow(area_ptr.0) };
-                        if area.is_realized() {
-                            area.queue_render();
-                        }
+                for area in crate::ghostty::callbacks::registered_gl_areas() {
+                    if area.is_realized() {
+                        area.queue_render();
                     }
                 }
             },
@@ -1971,6 +1995,19 @@ mod tests {
             (3, Rect { x: 110.0, y: 0.0, w: 100.0, h: 100.0 }),
         ];
         assert_eq!(pick_neighbor(&rects, 1, FocusDirection::Right), Some(3));
+    }
+
+    #[test]
+    fn next_pane_follows_tree_order_and_wraps() {
+        let ids = [4, 9, 2];
+        assert_eq!(next_pane_in_order(&ids, 4), Some(9));
+        assert_eq!(next_pane_in_order(&ids, 9), Some(2));
+        assert_eq!(next_pane_in_order(&ids, 2), Some(4));
+        // One pane: it is its own next pane.
+        assert_eq!(next_pane_in_order(&[7], 7), Some(7));
+        // Unknown active pane: nothing to move from.
+        assert_eq!(next_pane_in_order(&ids, 1), None);
+        assert_eq!(next_pane_in_order(&[], 1), None);
     }
 
     #[test]

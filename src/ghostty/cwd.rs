@@ -21,6 +21,9 @@ pub struct PaneTrack {
     pub shell_pid: Option<i32>,
     /// SSH pane: its shell runs remotely, so its folders are not local paths and are not tracked.
     pub remote: bool,
+    /// Folder the pane was started in. Only a fallback: it answers until the shell reports a
+    /// folder or /proc finds the shell, so it is never preferred over the shell's own report.
+    pub initial: Option<PathBuf>,
 }
 
 /// Shared handle to a pane's `PaneTrack`.
@@ -103,16 +106,21 @@ fn children_of(pid: i32) -> Vec<i32> {
 /// Folder of a pane's shell. Uses the folder the shell reported when it still exists; otherwise
 /// the /proc cwd of the shell (its pid is cached in `track`). None if neither is known.
 pub fn pane_cwd(pane_id: u64, track: &PaneTrackCell) -> Option<PathBuf> {
-    let (reported, cached_pid) = {
+    let (reported, cached_pid, initial) = {
         let t = track.lock().ok()?;
         if t.remote {
             return None;
         }
-        (t.cwd.clone(), t.shell_pid)
+        (t.cwd.clone(), t.shell_pid, t.initial.clone())
     };
     if let Some(path) = reported.as_deref().and_then(|s| validate_cwd(Path::new(s))) {
         return Some(path);
     }
+    proc_cwd(pane_id, track, cached_pid).or_else(|| initial.and_then(|p| validate_cwd(&p)))
+}
+
+/// Folder of the pane's shell as /proc reports it. None until the shell exists.
+fn proc_cwd(pane_id: u64, track: &PaneTrackCell, cached_pid: Option<i32>) -> Option<PathBuf> {
     let pid = match cached_pid.filter(|&pid| pid_has_pane_id(pid, pane_id)) {
         Some(pid) => pid,
         None => {
@@ -164,6 +172,17 @@ mod tests {
         let track = new_track();
         track.lock().unwrap().cwd = Some("/".to_string());
         assert_eq!(pane_cwd(u64::MAX, &track), Some(PathBuf::from("/")));
+    }
+
+    /// Before the shell exists (no realize yet), the folder the pane was started in answers.
+    #[test]
+    fn initial_folder_answers_before_the_shell_exists() {
+        let track = new_track();
+        track.lock().unwrap().initial = Some(PathBuf::from("/"));
+        assert_eq!(pane_cwd(u64::MAX, &track), Some(PathBuf::from("/")));
+        // A reported folder still wins over the initial one.
+        track.lock().unwrap().cwd = Some("/usr".to_string());
+        assert_eq!(pane_cwd(u64::MAX, &track), Some(PathBuf::from("/usr")));
     }
 
     #[test]

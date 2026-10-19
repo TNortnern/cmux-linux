@@ -1,14 +1,15 @@
+use crate::app_state::{defer, with_state};
 use gtk4::prelude::*;
 use gtk4::gio;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 /// Register all GIO actions on the ApplicationWindow.
 /// Actions are named "win.{action-name}" and can be invoked by buttons, menus, and shortcuts.
 /// Per D-11, D-12: all menu items mirror existing keyboard shortcut actions.
+///
+/// Activations run their work from a later GLib idle (`with_state` or `defer`), because an
+/// activation is a GTK signal that can fire while AppState is already borrowed.
 pub fn register_actions(
     window: &gtk4::ApplicationWindow,
-    state: Rc<RefCell<crate::app_state::AppState>>,
     sidebar: &gtk4::Box,
     app: &gtk4::Application,
 ) {
@@ -16,65 +17,43 @@ pub fn register_actions(
 
     // win.new-workspace (D-01, D-05)
     let action = gio::SimpleAction::new("new-workspace", None);
-    action.connect_activate({
-        let state = state.clone();
-        let app = app.clone();
-        move |_, _| {
-            crate::shortcuts::handle_new_workspace(&state, &app);
-        }
+    action.connect_activate(|_, _| {
+        with_state(crate::shortcuts::handle_new_workspace);
     });
     window.add_action(&action);
 
     // win.new-tab (Ctrl+Shift+T)
     let action = gio::SimpleAction::new("new-tab", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            crate::shortcuts::handle_new_tab(&state);
-        }
+    action.connect_activate(|_, _| {
+        with_state(crate::shortcuts::handle_new_tab);
     });
     window.add_action(&action);
 
     // win.new-ssh-workspace
     let action = gio::SimpleAction::new("new-ssh-workspace", None);
-    action.connect_activate({
-        let state = state.clone();
-        let app = app.clone();
-        move |_, _| {
-            crate::shortcuts::handle_new_ssh_workspace(&state, &app);
-        }
+    action.connect_activate(|_, _| {
+        with_state(crate::shortcuts::handle_new_ssh_workspace);
     });
     window.add_action(&action);
 
     // win.browser-open (D-07)
     let action = gio::SimpleAction::new("browser-open", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            crate::shortcuts::handle_browser_open(&state);
-        }
+    action.connect_activate(|_, _| {
+        with_state(crate::shortcuts::handle_browser_open);
     });
     window.add_action(&action);
 
     // win.close-pane
     let action = gio::SimpleAction::new("close-pane", None);
-    action.connect_activate({
-        let state = state.clone();
-        let app = app.clone();
-        move |_, _| {
-            crate::shortcuts::handle_close_pane(&state, &app);
-        }
+    action.connect_activate(|_, _| {
+        with_state(crate::shortcuts::handle_close_pane);
     });
     window.add_action(&action);
 
     // win.close-workspace
     let action = gio::SimpleAction::new("close-workspace", None);
-    action.connect_activate({
-        let state = state.clone();
-        let app = app.clone();
-        move |_, _| {
-            crate::shortcuts::handle_close_workspace(&state, &app);
-        }
+    action.connect_activate(|_, _| {
+        with_state(crate::shortcuts::handle_close_workspace);
     });
     window.add_action(&action);
 
@@ -82,49 +61,15 @@ pub fn register_actions(
 
     // win.copy (Ctrl+Shift+C) -- invoke Ghostty's copy_to_clipboard binding action
     let action = gio::SimpleAction::new("copy", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            let s = state.borrow();
-            if let Some(engine) = s.active_split_engine() {
-                if let Some(pane_id) = engine.root.find_active_pane_id() {
-                    if let Some(surface) = engine.root.find_surface_for_pane(pane_id) {
-                        let action_str = b"copy_to_clipboard";
-                        unsafe {
-                            crate::ghostty::ffi::ghostty_surface_binding_action(
-                                surface,
-                                action_str.as_ptr() as *const _,
-                                action_str.len(),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    action.connect_activate(|_, _| {
+        defer(|s| binding_action_on_focused_pane(s, b"copy_to_clipboard"));
     });
     window.add_action(&action);
 
     // win.paste (Ctrl+Shift+V) -- invoke Ghostty's paste_from_clipboard binding action
     let action = gio::SimpleAction::new("paste", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            let s = state.borrow();
-            if let Some(engine) = s.active_split_engine() {
-                if let Some(pane_id) = engine.root.find_active_pane_id() {
-                    if let Some(surface) = engine.root.find_surface_for_pane(pane_id) {
-                        let action_str = b"paste_from_clipboard";
-                        unsafe {
-                            crate::ghostty::ffi::ghostty_surface_binding_action(
-                                surface,
-                                action_str.as_ptr() as *const _,
-                                action_str.len(),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    action.connect_activate(|_, _| {
+        defer(|s| binding_action_on_focused_pane(s, b"paste_from_clipboard"));
     });
     window.add_action(&action);
 
@@ -144,9 +89,9 @@ pub fn register_actions(
         if !config_path.exists() {
             let _ = std::fs::write(&config_path, "# cmux configuration\n# See documentation for options\n");
         }
-        let _ = std::process::Command::new(&editor)
-            .arg(&config_path)
-            .spawn();
+        if let Err(e) = std::process::Command::new(&editor).arg(&config_path).spawn() {
+            cmux_warn!("could not start editor {editor}: {e}");
+        }
     });
     window.add_action(&action);
 
@@ -155,89 +100,69 @@ pub fn register_actions(
     // win.toggle-sidebar
     let action = gio::SimpleAction::new("toggle-sidebar", None);
     action.connect_activate({
-        let state = state.clone();
         let sidebar = sidebar.clone();
         move |_, _| {
-            let visible = sidebar.is_visible();
-            sidebar.set_visible(!visible);
-            if let Some(engine) = state.borrow_mut().active_split_engine_mut() {
-                engine.focus_active_surface();
-            }
+            let sidebar = sidebar.clone();
+            defer(move |s| {
+                let visible = sidebar.is_visible();
+                sidebar.set_visible(!visible);
+                if let Some(engine) = s.active_split_engine() {
+                    engine.focus_active_surface();
+                }
+            });
         }
     });
     window.add_action(&action);
 
     // win.split-right
     let action = gio::SimpleAction::new("split-right", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            crate::shortcuts::handle_split(&state, false);
-        }
+    action.connect_activate(|_, _| {
+        with_state(|state| crate::shortcuts::handle_split(state, false));
     });
     window.add_action(&action);
 
     // win.split-down
     let action = gio::SimpleAction::new("split-down", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            crate::shortcuts::handle_split(&state, true);
-        }
+    action.connect_activate(|_, _| {
+        with_state(|state| crate::shortcuts::handle_split(state, true));
     });
     window.add_action(&action);
 
     // win.split-auto (Alt+Shift+D)
     let action = gio::SimpleAction::new("split-auto", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            crate::shortcuts::handle_split_auto(&state);
-        }
+    action.connect_activate(|_, _| {
+        with_state(crate::shortcuts::handle_split_auto);
     });
     window.add_action(&action);
 
     // win.zoom-pane (Ctrl+Shift+Z)
     let action = gio::SimpleAction::new("zoom-pane", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            crate::shortcuts::handle_zoom(&state);
-        }
+    action.connect_activate(|_, _| {
+        with_state(crate::shortcuts::handle_zoom);
     });
     window.add_action(&action);
 
     // win.equalize (Ctrl+Shift+E)
     let action = gio::SimpleAction::new("equalize", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            crate::shortcuts::handle_equalize(&state);
-        }
+    action.connect_activate(|_, _| {
+        with_state(crate::shortcuts::handle_equalize);
     });
     window.add_action(&action);
 
     // win.rename-tab (Ctrl+Shift+R)
     let action = gio::SimpleAction::new("rename-tab", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            state.borrow_mut().begin_active_tab_rename();
-        }
+    action.connect_activate(|_, _| {
+        defer(|s| s.begin_active_tab_rename());
     });
     window.add_action(&action);
 
     // win.rename-workspace (sidebar context menu)
     let action = gio::SimpleAction::new("rename-workspace", None);
-    action.connect_activate({
-        let state = state.clone();
-        move |_, _| {
-            let (active_index, sidebar_list) = {
-                let s = state.borrow();
-                (s.active_index, s.sidebar_list.clone())
-            };
-            crate::sidebar::start_inline_rename(&sidebar_list, active_index, state.clone());
-        }
+    action.connect_activate(|_, _| {
+        with_state(|state| {
+            let list = state.borrow().sidebar_list.clone();
+            crate::sidebar::start_inline_rename(&list, state);
+        });
     });
     window.add_action(&action);
 
@@ -301,6 +226,25 @@ pub fn register_actions(
     let action = gio::SimpleAction::new("copy-url", None);
     action.set_enabled(false); // TODO: enable when BrowserManager.current_url() is available
     window.add_action(&action);
+}
+
+/// Sends a Ghostty binding action (for example `copy_to_clipboard`) to the focused pane.
+fn binding_action_on_focused_pane(s: &crate::app_state::AppState, action: &[u8]) {
+    let Some(engine) = s.active_split_engine() else {
+        return;
+    };
+    let Some(pane_id) = engine.root.find_active_pane_id() else {
+        return;
+    };
+    if let Some(surface) = engine.root.find_surface_for_pane(pane_id) {
+        unsafe {
+            crate::ghostty::ffi::ghostty_surface_binding_action(
+                surface,
+                action.as_ptr() as *const _,
+                action.len(),
+            );
+        }
+    }
 }
 
 /// Register keyboard accelerators for GIO actions so menus show shortcut hints.

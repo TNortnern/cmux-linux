@@ -8,11 +8,20 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
 
-/// One tab button and the label inside it.
+/// What the tab bar shows for one tab.
+pub struct TabInfo {
+    pub id: u64,
+    pub name: String,
+    /// The tab has a pane with unread bell activity: its button shows a dot.
+    pub attention: bool,
+}
+
+/// One tab button and the widgets inside it.
 struct Item {
     id: u64,
     widget: gtk4::Box,
     label: gtk4::Label,
+    dot: gtk4::Label,
 }
 
 pub struct TabBar {
@@ -69,19 +78,20 @@ impl TabBar {
         self.renaming.set(tab);
     }
 
-    /// Shows `tabs` (id, name) in order, with the tab `active` selected.
-    pub fn set_tabs(&self, tabs: &[(u64, String)], active: u64) {
+    /// Shows `tabs` in order, with the tab `active` selected.
+    pub fn set_tabs(&self, tabs: &[TabInfo], active: u64) {
         let rename = self.renaming.get();
         let same_order = {
             let items = self.items.borrow();
             items.len() == tabs.len()
-                && items.iter().zip(tabs).all(|(item, (id, _))| item.id == *id)
+                && items.iter().zip(tabs).all(|(item, tab)| item.id == tab.id)
         };
         if same_order && rename == self.built_rename.get() {
             let items = self.items.borrow();
-            for (item, (_, name)) in items.iter().zip(tabs) {
-                item.label.set_text(name);
-                if item.id == active {
+            for (item, tab) in items.iter().zip(tabs) {
+                item.label.set_text(&tab.name);
+                item.dot.set_visible(tab.attention);
+                if tab.id == active {
                     item.widget.add_css_class("tab-active");
                 } else {
                     item.widget.remove_css_class("tab-active");
@@ -92,22 +102,23 @@ impl TabBar {
         }
     }
 
-    fn rebuild(&self, tabs: &[(u64, String)], active: u64, rename: Option<u64>) {
+    fn rebuild(&self, tabs: &[TabInfo], active: u64, rename: Option<u64>) {
         while let Some(child) = self.strip.first_child() {
             self.strip.remove(&child);
         }
         let mut items = self.items.borrow_mut();
         items.clear();
-        for (id, name) in tabs {
-            let item = self.build_item(*id, name, *id == active, rename == Some(*id));
+        for tab in tabs {
+            let item = self.build_item(tab, tab.id == active, rename == Some(tab.id));
             self.strip.append(&item.widget);
             items.push(item);
         }
         self.built_rename.set(rename);
     }
 
-    fn build_item(&self, id: u64, name: &str, active: bool, editing: bool) -> Item {
+    fn build_item(&self, tab: &TabInfo, active: bool, editing: bool) -> Item {
         let ws_id = self.ws_id;
+        let id = tab.id;
 
         let widget = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         widget.add_css_class("tab");
@@ -115,13 +126,13 @@ impl TabBar {
             widget.add_css_class("tab-active");
         }
 
-        let label = gtk4::Label::new(Some(name));
+        let label = gtk4::Label::new(Some(&tab.name));
         label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         label.set_max_width_chars(24);
 
         if editing {
             let entry = gtk4::Entry::new();
-            entry.set_text(name);
+            entry.set_text(&tab.name);
             entry.set_width_chars(16);
             entry.add_css_class("tab-rename");
             entry.connect_activate(move |e| {
@@ -150,6 +161,12 @@ impl TabBar {
         } else {
             widget.append(&label);
         }
+
+        // Attention dot: shown while a pane in this tab has an unread bell.
+        let dot = gtk4::Label::new(None);
+        dot.add_css_class("attention-dot");
+        dot.set_visible(tab.attention);
+        widget.append(&dot);
 
         let close = gtk4::Button::with_label("\u{00D7}");
         close.add_css_class("tab-close");
@@ -196,6 +213,6 @@ impl TabBar {
         });
         widget.add_controller(drop);
 
-        Item { id, widget, label }
+        Item { id, widget, label, dot }
     }
 }

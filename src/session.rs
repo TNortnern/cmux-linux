@@ -1,5 +1,6 @@
 use crate::split_engine::SplitNodeData;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Schema written by this build. Schema 1 (one layout per workspace) is still read and migrated.
@@ -104,23 +105,44 @@ pub fn session_path() -> PathBuf {
     PathBuf::from(base).join("cmux").join("session.json")
 }
 
-/// Save session data atomically.
-/// Writes to session.json.tmp first, then rename()s to session.json.
-/// rename() is atomic on Linux (same filesystem). kill -9 mid-write leaves .tmp only.
-pub fn save_session_atomic(data: &SessionData) -> std::io::Result<()> {
-    save_session_to(data, &session_path())
+/// Set by `save_session_final`. Once set, debounced saves are skipped, so a snapshot that was
+/// taken before quit cannot land after the final one.
+static FINAL_WRITTEN: AtomicBool = AtomicBool::new(false);
+
+/// Debounced save from the background task. Skipped once the final state has been written.
+pub fn save_session_debounced(data: &SessionData) -> std::io::Result<()> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if FINAL_WRITTEN.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    write_session_locked(data, &session_path())
 }
 
-/// Internal: save to a specific path (used in tests with temp paths).
+/// Quit-time save. Writes the final state and marks the session as final, so no later debounced
+/// save overwrites it. Both steps happen under the save lock.
+pub fn save_session_final(data: &SessionData) -> std::io::Result<()> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    FINAL_WRITTEN.store(true, Ordering::SeqCst);
+    write_session_locked(data, &session_path())
+}
+
+/// Save to a specific path, atomically: written to session.json.tmp, then renamed over the
+/// target. rename() is atomic on Linux (same filesystem), so a crash leaves only the .tmp file.
+#[cfg(test)]
 pub fn save_session_to(data: &SessionData, path: &Path) -> std::io::Result<()> {
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    write_session_locked(data, path)
+}
+
+/// Writes the session file. The caller holds SAVE_LOCK.
+fn write_session_locked(data: &SessionData, path: &Path) -> std::io::Result<()> {
     // Ensure parent directory exists.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp_path = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     write_private(&tmp_path, json.as_bytes())?;
     std::fs::rename(&tmp_path, path)?;
     Ok(())
@@ -155,18 +177,18 @@ pub fn load_session_from(path: &Path) -> Option<SessionData> {
     let content = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("cmux: no session file at {}", path.display());
+            cmux_debug!("no session file at {}", path.display());
             return None;
         }
         Err(e) => {
-            eprintln!("cmux: session file read error: {e}");
+            cmux_warn!("session file read error: {e}");
             return None;
         }
     };
     match parse_session(&content) {
         Ok(data) => Some(data),
         Err(e) => {
-            eprintln!("cmux: {e}, ignoring");
+            cmux_warn!("{e}, ignoring");
             None
         }
     }

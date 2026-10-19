@@ -479,7 +479,7 @@ pub fn handle_socket_command(
             // SOCK-05: No focus side effects. Un-zooms first, as the engine does.
             let resized = {
                 let mut s = state.borrow_mut();
-                s.active_split_engine_mut().map_or(false, |engine| engine.resize_active(direction, px))
+                s.active_split_engine_mut().is_some_and(|engine| engine.resize_active(direction, px))
             };
             let _ = resp_tx.send(ok(req_id, json!({"resized": resized})));
         }
@@ -558,22 +558,15 @@ pub fn handle_socket_command(
 
         SocketCommand::SurfaceFocus { req_id, id, resp_tx } => {
             // SOCK-05: surface.focus IS a focus-intent command — allowed to change focus.
-            let pane_id = {
-                let s = state.borrow();
-                s.active_split_engine()
-                    .and_then(|engine| engine.find_pane_id_by_uuid(&id))
+            let focused = {
+                let mut s = state.borrow_mut();
+                s.active_split_engine_mut().and_then(|engine| {
+                    let pid = engine.find_pane_id_by_uuid(&id)?;
+                    engine.focus_pane(pid).then_some(pid)
+                })
             };
-            match pane_id {
-                Some(pid) => {
-                    let mut s = state.borrow_mut();
-                    if let Some(engine) = s.active_split_engine_mut() {
-                        engine.active_pane_id = pid;
-                        engine.root.update_focus_css(pid);
-                        engine.grab_active_focus();
-                    }
-                    drop(s);
-                    let _ = resp_tx.send(ok(req_id, json!({})));
-                }
+            match focused {
+                Some(_) => { let _ = resp_tx.send(ok(req_id, json!({}))); }
                 None => { let _ = resp_tx.send(err(req_id, "not_found", "surface not found")); }
             }
         }
@@ -714,22 +707,26 @@ pub fn handle_socket_command(
 
         SocketCommand::PaneFocus { req_id, id, resp_tx } => {
             // SOCK-05: pane.focus IS focus-intent — allowed to change focus.
-            let pane_id = {
-                let s = state.borrow();
-                if let Some(engine) = s.active_split_engine() {
-                    id.as_ref().and_then(|uuid_str| engine.find_pane_id_by_uuid(uuid_str))
-                } else { None }
+            // Without an id, focus moves to the next pane of the active tab (wrapping).
+            let focused = {
+                let mut s = state.borrow_mut();
+                match s.active_split_engine_mut() {
+                    Some(engine) => match id.as_deref() {
+                        Some(uuid) => engine
+                            .find_pane_id_by_uuid(uuid)
+                            .filter(|&pid| engine.focus_pane(pid)),
+                        None => engine.focus_next_pane(),
+                    },
+                    None => None,
+                }
             };
-            match pane_id {
+            match focused {
                 Some(pid) => {
-                    let mut s = state.borrow_mut();
-                    if let Some(engine) = s.active_split_engine_mut() {
-                        engine.active_pane_id = pid;
-                        engine.root.update_focus_css(pid);
-                        engine.grab_active_focus();
-                    }
-                    drop(s);
-                    let _ = resp_tx.send(ok(req_id, json!({})));
+                    let uuid = state
+                        .borrow()
+                        .active_split_engine()
+                        .and_then(|engine| engine.root.find_uuid_for_pane(pid));
+                    let _ = resp_tx.send(ok(req_id, json!({"id": uuid})));
                 }
                 None => { let _ = resp_tx.send(err(req_id, "not_found", "pane not found")); }
             }
@@ -886,7 +883,7 @@ pub fn handle_socket_command(
                                     // stream wired to preview pane
                                 }
                                 Err(e) => {
-                                    eprintln!("cmux: stream enable failed: {}", e);
+                                    cmux_warn!("stream enable failed: {}", e);
                                 }
                             }
                         } else {
