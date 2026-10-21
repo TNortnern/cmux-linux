@@ -41,8 +41,8 @@ Packages install `cmux-app` (the GUI), `cmux` (the CLI), a desktop entry, shell 
 
 ## Requirements
 
-- Ubuntu 24.04 or newer, Fedora 40 or newer, or a current Arch Linux
-- GTK 4.14 or newer
+- Ubuntu 22.04 or newer, Debian 12 or newer, Fedora 38 or newer, or a current Arch Linux
+- GTK 4.6 or newer (fractional scaling needs GTK 4.12+; it falls back to integer scaling)
 - OpenGL 4.3, from Mesa or your GPU vendor's driver
 
 ## Keyboard shortcuts

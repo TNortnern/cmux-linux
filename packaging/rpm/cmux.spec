@@ -16,7 +16,7 @@ AutoReqProv:    no
 # Do not create /usr/lib/.build-id links for the prebuilt binaries
 %define _build_id_links none
 
-Requires:       gtk4 >= 4.14
+Requires:       gtk4 >= 4.6
 Requires:       fontconfig
 Requires:       freetype
 Requires:       mesa-libGL

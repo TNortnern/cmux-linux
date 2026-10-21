@@ -47,7 +47,7 @@ Maintainer: cmux-linux contributors <noreply@github.com>
 Installed-Size: ${INSTALLED_SIZE}
 Section: utils
 Priority: optional
-Depends: libgtk-4-1 (>= 4.14), libfontconfig1, libfreetype6, libgl1, libbz2-1.0, libstdc++6, libgcc-s1
+Depends: libgtk-4-1 (>= 4.6), libfontconfig1, libfreetype6, libgl1, libbz2-1.0, libstdc++6, libgcc-s1
 Homepage: https://github.com/TNortnern/cmux-linux
 Description: GPU-accelerated terminal multiplexer
  cmux provides workspaces, tabs, splits, session restore, notifications and
