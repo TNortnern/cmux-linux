@@ -6,6 +6,8 @@
 //! going through lib.rs. A lib.rs target breaks ghostty FFI linking
 //! for cmux-app (see commit fd436c5b).
 
+// Only the clap definitions are used here; the socket client and discovery are not.
+#[allow(dead_code)]
 #[path = "../cli/mod.rs"]
 mod cli;
 

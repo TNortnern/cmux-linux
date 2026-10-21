@@ -1,6 +1,7 @@
 // src/socket/handlers.rs — GTK main thread command dispatch
 
 use crate::socket::commands::SocketCommand;
+use crate::socket::params::TabRef;
 use gtk4::prelude::*;
 use serde_json::{json, Value};
 
@@ -59,11 +60,15 @@ pub fn handle_socket_command(
         }
 
         SocketCommand::Capabilities { req_id, resp_tx } => {
-            let methods: Vec<&str> = vec![
+            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+            let mut methods: Vec<&str> = vec![
                 "system.ping", "system.identify", "system.capabilities",
                 "workspace.list", "workspace.current", "workspace.create",
                 "workspace.select", "workspace.close", "workspace.rename",
                 "workspace.next", "workspace.previous", "workspace.last", "workspace.reorder",
+                "tab.list", "tab.new", "tab.select", "tab.close", "tab.next", "tab.prev",
+                "tab.move", "tab.rename",
+                "split.auto", "pane.cwd", "pane.resize", "pane.equalize", "pane.zoom",
                 "surface.list", "surface.split", "surface.focus", "surface.close",
                 "surface.send_text", "surface.send_key", "surface.read_text",
                 "surface.health", "surface.refresh",
@@ -104,8 +109,10 @@ pub fn handle_socket_command(
                 "browser.highlight",
                 "browser.state.save", "browser.state.load",
                 // Debug
-                "debug.layout", "debug.type",
+                "debug.layout",
             ];
+            #[cfg(debug_assertions)]
+            methods.push("debug.type");
             let _ = resp_tx.send(ok(req_id, json!({"methods": methods})));
         }
 
@@ -141,6 +148,12 @@ pub fn handle_socket_command(
         }
 
         SocketCommand::WorkspaceCreate { req_id, remote_target, resp_tx } => {
+            if let Some(ref target) = remote_target {
+                if let Err(e) = crate::ssh::target::validate_target(target) {
+                    let _ = resp_tx.send(err(req_id, "invalid_params", &e));
+                    return;
+                }
+            }
             if let Some(target) = remote_target {
                 // SSH workspace creation per D-13, D-15
                 // Create per-workspace bridge for SSH I/O routing
@@ -185,7 +198,7 @@ pub fn handle_socket_command(
             };
             match idx {
                 Some(i) => {
-                    state.borrow_mut().switch_to_index(i);
+                    state.borrow_mut().select_workspace(i);
                     let _ = resp_tx.send(ok(req_id, json!({})));
                 }
                 None => {
@@ -264,19 +277,7 @@ pub fn handle_socket_command(
             let idx = s.workspaces.iter().position(|ws| ws.uuid.to_string() == id);
             match idx {
                 Some(from) => {
-                    let to = position.min(s.workspaces.len().saturating_sub(1));
-                    let ws = s.workspaces.remove(from);
-                    let engine = s.split_engines.remove(from);
-                    s.workspaces.insert(to, ws);
-                    s.split_engines.insert(to, engine);
-                    // Adjust active_index after reorder.
-                    if from == s.active_index {
-                        s.active_index = to;
-                    } else if from < s.active_index && to >= s.active_index {
-                        s.active_index -= 1;
-                    } else if from > s.active_index && to <= s.active_index {
-                        s.active_index += 1;
-                    }
+                    s.move_workspace(from, position);
                     drop(s);
                     let _ = resp_tx.send(ok(req_id, json!({})));
                 }
@@ -305,7 +306,7 @@ pub fn handle_socket_command(
         SocketCommand::DebugLayout { req_id, resp_tx } => {
             // SOCK-05: No focus side effects.
             let s = state.borrow();
-            match s.split_engines.get(s.active_index) {
+            match s.active_split_engine() {
                 Some(engine) => {
                     let data = engine.root.to_data();
                     let json_tree = serde_json::to_value(&data).unwrap_or(Value::Null);
@@ -317,10 +318,11 @@ pub fn handle_socket_command(
             }
         }
 
+        #[cfg(debug_assertions)]
         SocketCommand::DebugType { req_id, text, resp_tx } => {
             // SOCK-05: No focus side effects (sends text to active surface without changing focus).
             let s = state.borrow();
-            if let Some(engine) = s.split_engines.get(s.active_index) {
+            if let Some(engine) = s.active_split_engine() {
                 if let Some(pane_id) = engine.root.find_active_pane_id() {
                     if let Some(surface) = engine.root.find_surface_for_pane(pane_id) {
                         if !surface.is_null() {
@@ -340,19 +342,185 @@ pub fn handle_socket_command(
         }
 
         // ── surface.* ────────────────────────────────────────────────────
+        // ── tab.* (Workspace -> Tabs -> Splits) ─────────────────────────────
+        SocketCommand::TabList { req_id, workspace, resp_tx } => {
+            // SOCK-05: No focus side effects.
+            let s = state.borrow();
+            let wi = match workspace.as_deref() {
+                Some(uuid) => s.workspaces.iter().position(|ws| ws.uuid.to_string() == uuid),
+                None => Some(s.active_index),
+            };
+            match wi.and_then(|i| s.workspaces.get(i)) {
+                Some(ws) => {
+                    let tabs: Vec<Value> = ws.tabs.iter().enumerate().map(|(i, tab)| {
+                        json!({
+                            "id": tab.id,
+                            "index": i,
+                            "name": tab.name,
+                            "selected": i == ws.active_tab,
+                            "panes": tab_pane_count(tab),
+                        })
+                    }).collect();
+                    let _ = resp_tx.send(ok(req_id, json!({"tabs": tabs})));
+                }
+                None => { let _ = resp_tx.send(err(req_id, "not_found", "workspace not found")); }
+            }
+        }
+
+        SocketCommand::TabNew { req_id, resp_tx } => {
+            // Opens a tab in the focused pane's folder and selects it (focus-intent).
+            let new_id = state.borrow_mut().new_tab();
+            match new_id {
+                Some(id) => {
+                    let s = state.borrow();
+                    let index = s.workspaces.get(s.active_index).map_or(0, |ws| ws.active_tab);
+                    let _ = resp_tx.send(ok(req_id, json!({"id": id, "index": index})));
+                }
+                None => {
+                    let _ = resp_tx.send(err(req_id, "tab_failed", "could not open a tab (SSH workspaces do not support tabs yet)"));
+                }
+            }
+        }
+
+        SocketCommand::TabSelect { req_id, target, resp_tx } => {
+            // SOCK-05: tab.select IS a focus-intent command.
+            let resolved = resolve_tab(&state.borrow(), Some(target));
+            match resolved {
+                Some((ws_id, tab_id)) => {
+                    state.borrow_mut().select_tab_by_id(ws_id, tab_id);
+                    let _ = resp_tx.send(ok(req_id, json!({})));
+                }
+                None => { let _ = resp_tx.send(err(req_id, "not_found", "tab not found")); }
+            }
+        }
+
+        SocketCommand::TabClose { req_id, target, resp_tx } => {
+            let resolved = resolve_tab(&state.borrow(), target);
+            match resolved {
+                Some((ws_id, tab_id)) => {
+                    let closed = state.borrow_mut().close_tab_by_id(ws_id, tab_id);
+                    if closed {
+                        let _ = resp_tx.send(ok(req_id, json!({})));
+                    } else {
+                        let _ = resp_tx.send(err(req_id, "close_failed", "could not close tab"));
+                    }
+                }
+                None => { let _ = resp_tx.send(err(req_id, "not_found", "tab not found")); }
+            }
+        }
+
+        SocketCommand::TabNext { req_id, resp_tx } => {
+            // SOCK-05: focus-intent command.
+            state.borrow_mut().next_tab();
+            let _ = resp_tx.send(ok(req_id, json!({})));
+        }
+
+        SocketCommand::TabPrev { req_id, resp_tx } => {
+            // SOCK-05: focus-intent command.
+            state.borrow_mut().prev_tab();
+            let _ = resp_tx.send(ok(req_id, json!({})));
+        }
+
+        SocketCommand::TabMove { req_id, from, to, resp_tx } => {
+            // SOCK-05: No focus side effects. `to` is clamped to the last tab.
+            let len = state.borrow().workspaces.get(state.borrow().active_index).map_or(0, |ws| ws.tabs.len());
+            if from >= len {
+                let _ = resp_tx.send(err(req_id, "not_found", "tab not found"));
+            } else {
+                state.borrow_mut().move_tab(from, to);
+                let _ = resp_tx.send(ok(req_id, json!({})));
+            }
+        }
+
+        SocketCommand::TabRename { req_id, name, resp_tx } => {
+            // SOCK-05: No focus side effects.
+            state.borrow_mut().rename_active_tab(name);
+            let _ = resp_tx.send(ok(req_id, json!({})));
+        }
+
+        // ── layout of the active tab ────────────────────────────────────────
+        SocketCommand::SplitAuto { req_id, resp_tx } => {
+            // Splits the focused pane along its longer side. Returns the new pane's uuid.
+            let uuid = {
+                let mut s = state.borrow_mut();
+                s.active_split_engine_mut().and_then(|engine| {
+                    let new_pane = engine.split_auto()?;
+                    engine.root.find_uuid_for_pane(new_pane)
+                })
+            };
+            match uuid {
+                Some(uuid) => { let _ = resp_tx.send(ok(req_id, json!({"uuid": uuid}))); }
+                None => { let _ = resp_tx.send(err(req_id, "split_failed", "could not split pane")); }
+            }
+        }
+
+        SocketCommand::PaneCwd { req_id, id, resp_tx } => {
+            // SOCK-05: No focus side effects. Reads the folder; `id` is a pane uuid, default focused pane.
+            let s = state.borrow();
+            let Some(engine) = s.active_split_engine() else {
+                let _ = resp_tx.send(err(req_id, "no_workspace", "no active workspace"));
+                return;
+            };
+            let pane = match id {
+                Some(uuid) => engine.find_pane_id_by_uuid(&uuid),
+                None => Some(engine.active_pane_id),
+            };
+            match pane {
+                Some(pid) => {
+                    let cwd = pane_folder(engine, pid);
+                    let uuid = engine.root.find_uuid_for_pane(pid);
+                    let _ = resp_tx.send(ok(req_id, json!({"id": uuid, "cwd": cwd})));
+                }
+                None => { let _ = resp_tx.send(err(req_id, "not_found", "pane not found")); }
+            }
+        }
+
+        SocketCommand::PaneResize { req_id, direction, px, resp_tx } => {
+            // SOCK-05: No focus side effects. Un-zooms first, as the engine does.
+            let resized = {
+                let mut s = state.borrow_mut();
+                s.active_split_engine_mut().is_some_and(|engine| engine.resize_active(direction, px))
+            };
+            let _ = resp_tx.send(ok(req_id, json!({"resized": resized})));
+        }
+
+        SocketCommand::PaneEqualize { req_id, resp_tx } => {
+            let done = {
+                let mut s = state.borrow_mut();
+                match s.active_split_engine_mut() {
+                    Some(engine) => { engine.equalize(); true }
+                    None => false,
+                }
+            };
+            if done {
+                let _ = resp_tx.send(ok(req_id, json!({})));
+            } else {
+                let _ = resp_tx.send(err(req_id, "no_workspace", "no active workspace"));
+            }
+        }
+
+        SocketCommand::PaneZoom { req_id, resp_tx } => {
+            // Toggles zoom on the focused pane. Returns the zoom state after the call.
+            let zoomed = {
+                let mut s = state.borrow_mut();
+                match s.active_split_engine_mut() {
+                    Some(engine) => {
+                        engine.toggle_zoom();
+                        Some(engine.is_zoomed())
+                    }
+                    None => None,
+                }
+            };
+            match zoomed {
+                Some(zoomed) => { let _ = resp_tx.send(ok(req_id, json!({"zoomed": zoomed}))); }
+                None => { let _ = resp_tx.send(err(req_id, "no_workspace", "no active workspace")); }
+            }
+        }
+
         SocketCommand::SurfaceList { req_id, resp_tx } => {
             // SOCK-05: No focus side effects.
             let s = state.borrow();
-            let mut panes: Vec<Value> = Vec::new();
-            for (ws_idx, (ws, engine)) in s.workspaces.iter().zip(s.split_engines.iter()).enumerate() {
-                for (pane_uuid, _pane_id, active) in engine.all_panes() {
-                    panes.push(json!({
-                        "uuid": pane_uuid.to_string(),
-                        "workspace_uuid": ws.uuid.to_string(),
-                        "active": active && ws_idx == s.active_index,
-                    }));
-                }
-            }
+            let panes = pane_listing(&s);
             let _ = resp_tx.send(ok(req_id, json!({"surfaces": panes})));
         }
 
@@ -366,8 +534,7 @@ pub fn handle_socket_command(
             };
             let result = {
                 let mut s = state.borrow_mut();
-                let idx = s.active_index;
-                if let Some(engine) = s.split_engines.get_mut(idx) {
+                if let Some(engine) = s.active_split_engine_mut() {
                     engine.split_active(orientation)
                         .and_then(|new_pane_id| {
                             // Find the uuid of the newly created pane.
@@ -391,50 +558,33 @@ pub fn handle_socket_command(
 
         SocketCommand::SurfaceFocus { req_id, id, resp_tx } => {
             // SOCK-05: surface.focus IS a focus-intent command — allowed to change focus.
-            let pane_id = {
-                let s = state.borrow();
-                s.split_engines.get(s.active_index)
-                    .and_then(|engine| engine.find_pane_id_by_uuid(&id))
+            let focused = {
+                let mut s = state.borrow_mut();
+                s.active_split_engine_mut().and_then(|engine| {
+                    let pid = engine.find_pane_id_by_uuid(&id)?;
+                    engine.focus_pane(pid).then_some(pid)
+                })
             };
-            match pane_id {
-                Some(pid) => {
-                    let mut s = state.borrow_mut();
-                    let idx = s.active_index;
-                    if let Some(engine) = s.split_engines.get_mut(idx) {
-                        engine.active_pane_id = pid;
-                        engine.root.update_focus_css(pid);
-                        engine.grab_active_focus();
-                    }
-                    drop(s);
-                    let _ = resp_tx.send(ok(req_id, json!({})));
-                }
+            match focused {
+                Some(_) => { let _ = resp_tx.send(ok(req_id, json!({}))); }
                 None => { let _ = resp_tx.send(err(req_id, "not_found", "surface not found")); }
             }
         }
 
         SocketCommand::SurfaceClose { req_id, id, resp_tx } => {
-            // Close pane by uuid. Set it as active, then close_active().
+            // Close pane by uuid. The last pane of a tab closes the tab, as the close-pane shortcut does.
             let pane_id = {
                 let s = state.borrow();
-                s.split_engines.get(s.active_index)
+                s.active_split_engine()
                     .and_then(|engine| engine.find_pane_id_by_uuid(&id))
             };
             match pane_id {
                 Some(pid) => {
-                    let result = {
-                        let mut s = state.borrow_mut();
-                        let idx = s.active_index;
-                        if let Some(engine) = s.split_engines.get_mut(idx) {
-                            engine.active_pane_id = pid;
-                            engine.root.update_focus_css(pid);
-                            engine.close_active()
-                        } else {
-                            None
-                        }
-                    };
-                    match result {
-                        Some(_) => { let _ = resp_tx.send(ok(req_id, json!({}))); }
-                        None => { let _ = resp_tx.send(err(req_id, "close_failed", "cannot close last pane")); }
+                    let closed = state.borrow_mut().close_pane(pid);
+                    if closed {
+                        let _ = resp_tx.send(ok(req_id, json!({})));
+                    } else {
+                        let _ = resp_tx.send(err(req_id, "close_failed", "could not close pane"));
                     }
                 }
                 None => { let _ = resp_tx.send(err(req_id, "not_found", "surface not found")); }
@@ -445,7 +595,7 @@ pub fn handle_socket_command(
             // SOCK-05: send_text is NOT a focus-intent command — NO focus change.
             let surface = {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     if let Some(ref uuid_str) = id {
                         engine.find_surface_by_uuid(uuid_str)
                     } else {
@@ -475,7 +625,7 @@ pub fn handle_socket_command(
             // Complex key combos (ctrl+c, etc.) require ghostty_surface_key — Phase 4.
             let surface = {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     if let Some(ref uuid_str) = id {
                         engine.find_surface_by_uuid(uuid_str)
                     } else {
@@ -509,7 +659,7 @@ pub fn handle_socket_command(
             // SOCK-05: health is NOT focus-intent — NO focus change.
             let (found, has_attention) = {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     if let Some(ref uuid_str) = id {
                         let alive = engine.find_surface_by_uuid(uuid_str).is_some();
                         let attn = engine.find_pane_id_by_uuid(uuid_str)
@@ -532,7 +682,7 @@ pub fn handle_socket_command(
             // Queue a render on the target surface's GLArea.
             let gl_area = {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     let target_pane_id = if let Some(ref uuid_str) = id {
                         engine.find_pane_id_by_uuid(uuid_str)
                     } else {
@@ -551,38 +701,32 @@ pub fn handle_socket_command(
         SocketCommand::PaneList { req_id, resp_tx } => {
             // SOCK-05: No focus side effects. Alias for surface.list.
             let s = state.borrow();
-            let mut panes: Vec<Value> = Vec::new();
-            for (ws_idx, (ws, engine)) in s.workspaces.iter().zip(s.split_engines.iter()).enumerate() {
-                for (pane_uuid, _pane_id, active) in engine.all_panes() {
-                    panes.push(json!({
-                        "uuid": pane_uuid.to_string(),
-                        "workspace_uuid": ws.uuid.to_string(),
-                        "active": active && ws_idx == s.active_index,
-                    }));
-                }
-            }
+            let panes = pane_listing(&s);
             let _ = resp_tx.send(ok(req_id, json!({"panes": panes})));
         }
 
         SocketCommand::PaneFocus { req_id, id, resp_tx } => {
             // SOCK-05: pane.focus IS focus-intent — allowed to change focus.
-            let pane_id = {
-                let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
-                    id.as_ref().and_then(|uuid_str| engine.find_pane_id_by_uuid(uuid_str))
-                } else { None }
+            // Without an id, focus moves to the next pane of the active tab (wrapping).
+            let focused = {
+                let mut s = state.borrow_mut();
+                match s.active_split_engine_mut() {
+                    Some(engine) => match id.as_deref() {
+                        Some(uuid) => engine
+                            .find_pane_id_by_uuid(uuid)
+                            .filter(|&pid| engine.focus_pane(pid)),
+                        None => engine.focus_next_pane(),
+                    },
+                    None => None,
+                }
             };
-            match pane_id {
+            match focused {
                 Some(pid) => {
-                    let mut s = state.borrow_mut();
-                    let idx = s.active_index;
-                    if let Some(engine) = s.split_engines.get_mut(idx) {
-                        engine.active_pane_id = pid;
-                        engine.root.update_focus_css(pid);
-                        engine.grab_active_focus();
-                    }
-                    drop(s);
-                    let _ = resp_tx.send(ok(req_id, json!({})));
+                    let uuid = state
+                        .borrow()
+                        .active_split_engine()
+                        .and_then(|engine| engine.root.find_uuid_for_pane(pid));
+                    let _ = resp_tx.send(ok(req_id, json!({"id": uuid})));
                 }
                 None => { let _ = resp_tx.send(err(req_id, "not_found", "pane not found")); }
             }
@@ -593,7 +737,7 @@ pub fn handle_socket_command(
             // Phase 3 stub: re-grab focus on current active pane. Phase 4 tracks focus history.
             {
                 let s = state.borrow();
-                if let Some(engine) = s.split_engines.get(s.active_index) {
+                if let Some(engine) = s.active_split_engine() {
                     engine.grab_active_focus();
                 }
             }
@@ -634,6 +778,13 @@ pub fn handle_socket_command(
         // -- browser.* (Phase 8: D-04 lifecycle + streaming) --
         // SOCK-05: None of these commands steal focus.
         SocketCommand::BrowserOpen { req_id, url, workspace, resp_tx } => {
+            let url = match crate::socket::validate::normalize_browser_url(&url) {
+                Ok(url) => url,
+                Err(e) => {
+                    let _ = resp_tx.send(err(req_id, "invalid_url", &e));
+                    return;
+                }
+            };
             let mut s = state.borrow_mut();
             // Lazy-init BrowserManager per D-05
             if s.browser_manager.is_none() {
@@ -732,7 +883,7 @@ pub fn handle_socket_command(
                                     // stream wired to preview pane
                                 }
                                 Err(e) => {
-                                    eprintln!("cmux: stream enable failed: {}", e);
+                                    cmux_warn!("stream enable failed: {}", e);
                                 }
                             }
                         } else {
@@ -814,6 +965,22 @@ pub fn handle_socket_command(
                     "stream.disable" => "stream_disable",
                     _ => &action,
                 };
+                // Navigation takes the same URL rules as browser.open (scheme allowlist).
+                if matches!(daemon_action, "navigate" | "launch") {
+                    if let Some(raw) = params.get("url").and_then(|v| v.as_str()).map(String::from) {
+                        match crate::socket::validate::normalize_browser_url(&raw) {
+                            Ok(url) => {
+                                if let Some(obj) = params.as_object_mut() {
+                                    obj.insert("url".to_string(), json!(url));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = resp_tx.send(err(req_id, "invalid_url", &e));
+                                return;
+                            }
+                        }
+                    }
+                }
                 match bm.send_command(daemon_action, params) {
                     Ok(result) => {
                         let _ = resp_tx.send(ok(req_id, result));
@@ -834,7 +1001,27 @@ pub fn handle_socket_command(
     }
 }
 
-/// Walk the split tree to find the first Preview node's Picture widget.
+/// One entry per pane of every built tab. `active` marks the focused pane of the visible tab.
+fn pane_listing(s: &crate::app_state::AppState) -> Vec<Value> {
+    let mut panes = Vec::new();
+    for (ws_idx, ws) in s.workspaces.iter().enumerate() {
+        for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+            let Some(engine) = tab.engine.as_ref() else {
+                continue;
+            };
+            let visible = ws_idx == s.active_index && tab_idx == ws.active_tab;
+            for (pane_uuid, _pane_id, active) in engine.all_panes() {
+                panes.push(json!({
+                    "uuid": pane_uuid.to_string(),
+                    "workspace_uuid": ws.uuid.to_string(),
+                    "active": active && visible,
+                }));
+            }
+        }
+    }
+    panes
+}
+
 fn find_preview_picture(node: &crate::split_engine::SplitNode) -> Option<gtk4::Picture> {
     match node {
         crate::split_engine::SplitNode::Preview { picture, .. } => Some(picture.clone()),
@@ -843,4 +1030,44 @@ fn find_preview_picture(node: &crate::split_engine::SplitNode) -> Option<gtk4::P
         }
         crate::split_engine::SplitNode::Leaf { .. } => None,
     }
+}
+
+/// Id of the workspace and tab that `target` names in the active workspace. None `target`
+/// means the selected tab.
+fn resolve_tab(s: &crate::app_state::AppState, target: Option<TabRef>) -> Option<(u64, u64)> {
+    let ws = s.workspaces.get(s.active_index)?;
+    let ti = match target {
+        None => ws.active_tab,
+        Some(TabRef::Index(i)) => i,
+        Some(TabRef::Id(id)) => ws.tab_index(id)?,
+    };
+    let tab = ws.tabs.get(ti)?;
+    Some((ws.id, tab.id))
+}
+
+/// Pane count of a tab. A tab that is not built yet counts the leaves of its saved layout.
+fn tab_pane_count(tab: &crate::workspace::Tab) -> usize {
+    match (&tab.engine, &tab.saved) {
+        (Some(engine), _) => engine.all_panes().len(),
+        (None, Some(saved)) => count_saved_leaves(&saved.layout),
+        (None, None) => 0,
+    }
+}
+
+fn count_saved_leaves(node: &crate::split_engine::SplitNodeData) -> usize {
+    use crate::split_engine::SplitNodeData;
+    match node {
+        SplitNodeData::Leaf { .. } => 1,
+        SplitNodeData::Split { start, end, .. } => count_saved_leaves(start) + count_saved_leaves(end),
+    }
+}
+
+/// Folder of pane `pane_id`: the one its shell reported, else what /proc shows. None if unknown.
+fn pane_folder(engine: &crate::split_engine::SplitEngine, pane_id: u64) -> Option<String> {
+    use crate::split_engine::SplitNode;
+    let path = match engine.root.find_node(pane_id)? {
+        SplitNode::Leaf { pane_id, track, .. } => crate::ghostty::cwd::pane_cwd(*pane_id, track),
+        _ => None,
+    };
+    path.map(|p| p.to_string_lossy().into_owned())
 }

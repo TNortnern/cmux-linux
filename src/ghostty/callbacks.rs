@@ -1,6 +1,7 @@
+use crate::ghostty::surface::PaneCtx;
 use gtk4::ffi;
 use gtk4::prelude::{GLAreaExt, WidgetExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
@@ -21,18 +22,43 @@ pub static WAKEUP_PENDING: AtomicBool = AtomicBool::new(false);
 /// Safety: ghostty_app_t is opaque void* and only called from the GLib main thread.
 pub static APP_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The GhostttySurface handle — stored so read_clipboard_cb can complete paste requests.
-/// Safety: ghostty_surface_t is opaque void* and only accessed from the GLib main thread.
-pub static SURFACE_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// Registry of all live GLArea instances. wakeup_cb iterates this to queue_render all panes.
 /// Stores raw pointers because gtk4::GLArea is not Send/Sync. The pointers are only
-/// dereferenced on the main thread inside glib::idle_add_once closures.
+/// dereferenced on the main thread. An entry is added when a pane's surface is created and
+/// removed by teardown_pane, before the GLArea can be finalized.
+///
+/// Never hold this lock while calling into GTK or Ghostty: a call may re-enter a callback
+/// that takes the same lock. Take a snapshot with `registered_gl_areas` instead.
 pub static GL_AREA_REGISTRY: Mutex<Vec<GtkGLAreaPtr>> = Mutex::new(Vec::new());
 
-/// Maps surface_ptr (as usize) → pane_id for close_surface_cb routing.
+/// Owned GLArea handles for every registered pane. The lock is released before this returns,
+/// so the caller can call into GTK and Ghostty freely.
+pub fn registered_gl_areas() -> Vec<gtk4::GLArea> {
+    let Ok(areas) = GL_AREA_REGISTRY.lock() else {
+        return Vec::new();
+    };
+    areas
+        .iter()
+        // SAFETY: registered pointers are live GLAreas (teardown removes them before they are
+        // finalized), and this runs on the GLib main thread. from_glib_none takes its own reference.
+        .map(|p| unsafe { gtk4::glib::translate::from_glib_none(p.0) })
+        .collect()
+}
+
+/// Maps surface_ptr (as usize) → pane_id.
 pub static SURFACE_REGISTRY: LazyLock<Mutex<HashMap<usize, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Addresses of every `PaneCtx` that has not been torn down. Ghostty's callbacks carry only the
+/// userdata pointer, so they check this set before dereferencing it. teardown_pane removes an
+/// address before it frees the context.
+pub static LIVE_CTXS: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// True while the pane context at `addr` is registered as live.
+pub fn live_ctx_registered(addr: usize) -> bool {
+    LIVE_CTXS.lock().map(|live| live.contains(&addr)).unwrap_or(false)
+}
 
 /// Phase 4: Pane ID that most recently received a bell. Read by wakeup_cb to update attention state.
 pub static BELL_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -41,9 +67,6 @@ pub static BELL_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Called by Ghostty from its renderer thread. Must not call any ghostty_* API inline.
 /// Instead, schedules ghostty_app_tick() on the GLib main loop (per D-04, GHOST-07).
-/// Wakeup count for diagnostic logging (only logs occasionally to avoid spam)
-static WAKEUP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub unsafe extern "C" fn wakeup_cb(_userdata: *mut std::ffi::c_void) {
     // Swap: if already pending, another idle task is queued — skip.
     if WAKEUP_PENDING.swap(true, Ordering::SeqCst) {
@@ -51,12 +74,6 @@ pub unsafe extern "C" fn wakeup_cb(_userdata: *mut std::ffi::c_void) {
     }
     glib::idle_add_once(|| {
         WAKEUP_PENDING.store(false, Ordering::SeqCst);
-
-        // Log wakeup occasionally to verify it's firing
-        let count = WAKEUP_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-        if count % 60 == 1 {
-            eprintln!("cmux: wakeup_cb #{}", count);
-        }
 
         let app_ptr = APP_PTR.load(Ordering::SeqCst);
         if app_ptr != 0 {
@@ -66,13 +83,9 @@ pub unsafe extern "C" fn wakeup_cb(_userdata: *mut std::ffi::c_void) {
             }
         }
         // queue_render on ALL registered GLAreas
-        if let Ok(areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {
-            for area_ptr in areas.iter() {
-                let area: glib::translate::Borrowed<gtk4::GLArea> =
-                    unsafe { glib::translate::from_glib_borrow(area_ptr.0) };
-                if area.is_realized() {
-                    area.queue_render();
-                }
+        for area in registered_gl_areas() {
+            if area.is_realized() {
+                area.queue_render();
             }
         }
     });
@@ -83,16 +96,19 @@ pub unsafe extern "C" fn wakeup_cb(_userdata: *mut std::ffi::c_void) {
 pub static GL_TO_SURFACE: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Called by Ghostty when a surface wants to close (e.g. shell exits).
-/// Runs on the GLib main thread (called during ghostty_app_tick).
-/// Per D-09: no GUI dialog — exit the process.
-/// The bool argument indicates whether the process was still active when closed.
-pub unsafe extern "C" fn close_surface_cb(_userdata: *mut std::ffi::c_void, _process_alive: bool) {
-    // Do NOT call process::exit — Phase 2 handles per-pane close gracefully.
-    // Identify which pane closed via SURFACE_REGISTRY (populated at surface creation).
-    // Full AppState.close_pane() dispatch is wired in Plan 04.
-    // For now, log the event so the executor can verify routing works.
-    eprintln!("cmux: close_surface_cb fired — per-pane close will be handled by AppState");
+/// Called by Ghostty when a surface wants to close (its shell exited, or a close action fired).
+/// Runs inside ghostty_app_tick on the GLib main thread. Closing a pane frees the surface that
+/// ghostty is still processing, so the close is deferred to an idle callback. That callback
+/// carries only the pane id; it finds the pane again through AppState.
+pub unsafe extern "C" fn close_surface_cb(userdata: *mut std::ffi::c_void, _process_alive: bool) {
+    // The userdata is only a context address, so check it is still live before reading it.
+    if userdata.is_null() || !live_ctx_registered(userdata as usize) {
+        return;
+    }
+    let Some(pane_id) = (userdata as *const PaneCtx).as_ref().map(|ctx| ctx.pane_id) else {
+        return;
+    };
+    glib::idle_add_once(move || crate::app_state::close_pane_request(pane_id));
 }
 
 /// Action callback — Ghostty fires actions (e.g. new tab, font size changes).
@@ -126,15 +142,42 @@ pub unsafe extern "C" fn action_cb(
         return true;
     }
 
+    // The shell reported its folder (OSC 7 via shell integration). This runs on Ghostty's thread,
+    // not the GLib main thread, so it only writes the pane's Mutex-guarded track. The pane
+    // context is checked against the live set first: teardown_pane unregisters it before the
+    // surface is freed, so a report that races with a close is dropped.
+    if action.tag == ffi::ghostty_action_tag_e_GHOSTTY_ACTION_PWD {
+        if _target.tag == ffi::ghostty_target_tag_e_GHOSTTY_TARGET_SURFACE {
+            let surface = unsafe { _target.target.surface };
+            let ctx_addr = unsafe { ffi::ghostty_surface_userdata(surface) } as usize;
+            let pwd = unsafe { action.action.pwd.pwd };
+            if live_ctx_registered(ctx_addr) {
+                if let Some(ctx) = unsafe { (ctx_addr as *const PaneCtx).as_ref() } {
+                    let reported = if pwd.is_null() {
+                        None
+                    } else {
+                        unsafe { std::ffi::CStr::from_ptr(pwd) }.to_str().ok()
+                    };
+                    if let Some(path) = reported.filter(|p| p.starts_with('/')) {
+                        if let Ok(mut track) = ctx.track.lock() {
+                            if !track.remote {
+                                track.cwd = Some(path.to_owned());
+                            }
+                        }
+                        // Session save belongs on the main thread (the save itself is debounced).
+                        glib::idle_add_once(crate::app_state::request_session_save);
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     if action.tag == ffi::ghostty_action_tag_e_GHOSTTY_ACTION_RENDER {
         // Trigger a render on the GLArea — will call ghostty_surface_draw on main thread.
-        if let Ok(areas) = crate::ghostty::callbacks::GL_AREA_REGISTRY.lock() {
-            for area_ptr in areas.iter() {
-                let area: glib::translate::Borrowed<gtk4::GLArea> =
-                    unsafe { glib::translate::from_glib_borrow(area_ptr.0) };
-                if area.is_realized() {
-                    area.queue_render();
-                }
+        for area in registered_gl_areas() {
+            if area.is_realized() {
+                area.queue_render();
             }
         }
         return true;

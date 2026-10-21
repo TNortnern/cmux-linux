@@ -9,7 +9,7 @@ Use this skill to control non-browser cmux topology and routing.
 
 ## Core Concepts
 
-- Window: top-level macOS cmux window.
+- Window: top-level cmux window.
 - Workspace: tab-like group within a window.
 - Pane: split container in a workspace.
 - Surface: a tab within a pane (terminal or browser panel).

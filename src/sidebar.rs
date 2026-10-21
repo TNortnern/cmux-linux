@@ -1,6 +1,10 @@
+use crate::app_state::{defer, with_state, AppStateRef};
 use gtk4::prelude::*;
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::rc::Rc;
+
+/// Key under which a sidebar row keeps the id of the workspace it shows.
+const ROW_WORKSPACE_KEY: &str = "workspace-id";
 
 /// Build the sidebar widget: outer Box(V) > [ScrolledWindow(ListBox), Button(+)].
 /// Returns (sidebar_box, scrolled_window, list_box).
@@ -44,128 +48,140 @@ pub fn build_sidebar() -> (gtk4::Box, gtk4::ScrolledWindow, gtk4::ListBox) {
 }
 
 /// Wire sidebar click-to-switch. Called from main.rs after AppState is constructed.
-/// Per WS-03: clicking a row calls AppState.switch_to_index.
-pub fn wire_sidebar_clicks(
-    list_box: &gtk4::ListBox,
-    state: Rc<RefCell<crate::app_state::AppState>>,
-) {
-    list_box.connect_row_activated({
-        let state = state.clone();
-        move |_list, row| {
-            let index = row.index() as usize;
-            state.borrow_mut().switch_to_index(index);
-            // SPLIT-07: call ghostty_surface_set_focus on the newly active pane.
-            // Workspace switches are focus changes — must call set_focus after switch.
-            let surface = {
-                let mut s = state.borrow_mut();
-                s.active_split_engine_mut()
-                    .and_then(|engine| engine.root.find_active_pane_id())
-                    .and_then(|pane_id| {
-                        if let Ok(reg) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                            reg.iter()
-                                .find(|(_, &pid)| pid == pane_id)
-                                .map(|(&ptr, _)| ptr as crate::ghostty::ffi::ghostty_surface_t)
-                        } else {
-                            None
-                        }
-                    })
-            };
-            if let Some(surface) = surface {
-                unsafe {
-                    crate::ghostty::ffi::ghostty_surface_set_focus(surface, true);
-                }
-            }
-        }
+/// Per WS-03: clicking a row selects its workspace. The change runs through `defer`, since the
+/// activation can fire while AppState is borrowed.
+pub fn wire_sidebar_clicks(list_box: &gtk4::ListBox) {
+    list_box.connect_row_activated(|_list, row| {
+        let Some(ws_id) = row_workspace_id(row) else {
+            return;
+        };
+        defer(move |s| s.select_workspace_by_id(ws_id));
     });
 }
 
-/// Start inline rename for the active workspace row.
-/// Per UI-SPEC: replaces GtkLabel with GtkEntry; Enter commits, Escape cancels.
-/// Per D-03: rename triggered by Ctrl+Shift+R (keyboard only).
-pub fn start_inline_rename(
-    list_box: &gtk4::ListBox,
-    active_index: usize,
-    state: Rc<RefCell<crate::app_state::AppState>>,
-) {
-    let row = match list_box.row_at_index(active_index as i32) {
-        Some(r) => r,
-        None => return,
-    };
+/// Records which workspace a sidebar row shows.
+pub fn set_row_workspace_id(row: &gtk4::ListBoxRow, ws_id: u64) {
+    // SAFETY: this key is only ever written with a u64, by this function.
+    unsafe {
+        row.set_data(ROW_WORKSPACE_KEY, ws_id);
+    }
+}
 
-    // Get current name from the label (Phase 4 nested layout: row > hbox > vbox > label).
-    let current_name = row
-        .child()
-        .and_downcast::<gtk4::Box>()
-        .and_then(|hbox| hbox.first_child())
-        .and_downcast::<gtk4::Box>()
-        .and_then(|vbox| vbox.first_child())
+/// The workspace a sidebar row shows, if it was recorded.
+pub fn row_workspace_id(row: &gtk4::ListBoxRow) -> Option<u64> {
+    // SAFETY: the only value stored under this key is a u64 (see set_row_workspace_id).
+    unsafe { row.data::<u64>(ROW_WORKSPACE_KEY).map(|p| *p.as_ref()) }
+}
+
+/// The name label of a row's content box: hbox > vbox > label.
+fn name_label_of(hbox: &gtk4::Box) -> Option<gtk4::Label> {
+    hbox.first_child()
+        .and_downcast::<gtk4::Box>()?
+        .first_child()
         .and_downcast::<gtk4::Label>()
-        .map(|l| l.text().to_string())
-        .unwrap_or_default();
+}
 
-    // Replace label with entry.
+/// Shows `name` on a row. Does nothing while the row is being renamed (its child is an entry).
+pub fn set_row_name(row: &gtk4::ListBoxRow, name: &str) {
+    if let Some(label) = row.child().and_downcast::<gtk4::Box>().and_then(|h| name_label_of(&h)) {
+        label.set_text(name);
+    }
+}
+
+/// The attention dot of a row's content box: the child with the `attention-dot` class.
+pub fn attention_dot_of(row: &gtk4::ListBoxRow) -> Option<gtk4::Widget> {
+    let hbox = row.child().and_downcast::<gtk4::Box>()?;
+    let mut child = hbox.first_child();
+    while let Some(widget) = child {
+        if widget.has_css_class("attention-dot") {
+            return Some(widget);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+/// Start inline rename for the active workspace row.
+/// Per UI-SPEC: replaces the name with a GtkEntry; Enter commits, Escape cancels.
+/// Per D-03: rename triggered by Ctrl+Shift+R (keyboard only).
+///
+/// The row's own content box is kept and put back afterwards, so its close button and status
+/// line survive the rename. The commit is queued through `defer`, and it renames the workspace
+/// that was active when the rename started.
+pub fn start_inline_rename(list_box: &gtk4::ListBox, state: &AppStateRef) {
+    let (index, ws_id) = {
+        let s = state.borrow();
+        (s.active_index, s.active_workspace().map(|ws| ws.id))
+    };
+    let (Some(ws_id), Some(row)) = (ws_id, list_box.row_at_index(index as i32)) else {
+        return;
+    };
+    // A row already being renamed has an entry as its child, not the content box.
+    let Some(content) = row.child().and_downcast::<gtk4::Box>() else {
+        return;
+    };
+    let Some(name_label) = name_label_of(&content) else {
+        return;
+    };
+    let current_name = name_label.text().to_string();
+
     let entry = gtk4::Entry::new();
     entry.set_text(&current_name);
     entry.set_placeholder_text(Some("Workspace name"));
     entry.add_css_class("rename-entry");
+    // Setting the entry as the child unparents `content`; the handle kept here puts it back.
     row.set_child(Some(&entry));
-    entry.grab_focus();
 
-    // Enter key: commit rename.
-    entry.connect_activate({
-        let state = state.clone();
+    // Ends the rename once: Enter, focus-out and Escape can all fire for the same edit.
+    let done = Rc::new(Cell::new(false));
+    let finish: Rc<dyn Fn(Option<String>)> = Rc::new({
+        let done = done.clone();
         let row = row.clone();
+        let content = content.clone();
+        move |text: Option<String>| {
+            if done.replace(true) {
+                return;
+            }
+            let name = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+            if let Some(label) = name_label_of(&content) {
+                label.set_text(name.as_deref().unwrap_or(&current_name));
+            }
+            row.set_child(Some(&content));
+            if let Some(name) = name {
+                defer(move |s| s.rename_workspace_by_id(ws_id, name));
+            }
+        }
+    });
+
+    entry.connect_activate({
+        let finish = finish.clone();
+        move |e| finish(Some(e.text().to_string()))
+    });
+    entry.connect_has_focus_notify({
+        let finish = finish.clone();
         move |e| {
-            let new_name = e.text().to_string();
-            let trimmed = new_name.trim().to_string();
-            if !trimmed.is_empty() {
-                state.borrow_mut().rename_active(trimmed.clone());
-            }
-            // Restore Phase 4 nested layout: hbox > [vbox > [label], dot, close_btn]
-            let display = if trimmed.is_empty() { &new_name } else { &trimmed };
-            row.set_child(Some(&rebuild_sidebar_row_content(display)));
-        }
-    });
-
-    // Focus-out: commit rename (same as Enter).
-    entry.connect_notify_local(Some("has-focus"), {
-        let state = state.clone();
-        let row_clone = row.clone();
-        move |e, _| {
-            if !e.has_focus() && e.parent().is_some() {
-                let new_name = e.text().to_string();
-                let trimmed = new_name.trim().to_string();
-                if !trimmed.is_empty() {
-                    state.borrow_mut().rename_active(trimmed.clone());
-                }
-                let display = if trimmed.is_empty() { &new_name } else { &trimmed };
-                row_clone.set_child(Some(&rebuild_sidebar_row_content(display)));
+            if !e.has_focus() {
+                finish(Some(e.text().to_string()));
             }
         }
     });
-
-    // Escape key: cancel rename and restore original label.
-    let key_ctrl = gtk4::EventControllerKey::new();
-    key_ctrl.connect_key_pressed({
-        let row_clone = row.clone();
-        let current_name_clone = current_name.clone();
-        move |_, keyval, _, _| {
-            if keyval == gtk4::gdk::Key::Escape {
-                row_clone.set_child(Some(&rebuild_sidebar_row_content(&current_name_clone)));
-                gtk4::glib::Propagation::Stop
-            } else {
-                gtk4::glib::Propagation::Proceed
-            }
+    let keys = gtk4::EventControllerKey::new();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk4::gdk::Key::Escape {
+            finish(None);
+            gtk4::glib::Propagation::Stop
+        } else {
+            gtk4::glib::Propagation::Proceed
         }
     });
-    entry.add_controller(key_ctrl);
+    entry.add_controller(keys);
+    entry.grab_focus();
 }
 
-/// Rebuild the Phase 4 sidebar row content:
-/// GtkBox(H, 4) > [GtkBox(V, 0) > [GtkLabel(name)], GtkLabel(dot), Button(close)].
-/// Dot is hidden by default (fresh state after rename).
-/// Close button is hidden by default, shown on row hover via CSS (D-02).
-pub fn rebuild_sidebar_row_content(name: &str) -> gtk4::Box {
+/// Sidebar row content: GtkBox(H, 4) > [GtkBox(V, 0) > [GtkLabel(name)], GtkLabel(dot), Button(close)].
+/// Dot is hidden by default. The close button is hidden until the row is hovered (D-02), and is
+/// wired by `wire_row` when the row is added to the sidebar.
+pub fn row_content(name: &str) -> gtk4::Box {
     let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     let label = gtk4::Label::new(Some(name));
@@ -189,43 +205,27 @@ pub fn rebuild_sidebar_row_content(name: &str) -> gtk4::Box {
     hbox
 }
 
-/// Wire the close button for a specific sidebar row.
-/// Called when a row is created (in app_state::create_workspace or after rename rebuild).
-pub fn wire_row_close_button(
-    row: &gtk4::ListBoxRow,
-    state: Rc<RefCell<crate::app_state::AppState>>,
-    app: &gtk4::Application,
-) {
+/// Wires a sidebar row for workspace `ws_id`: its close button and right-click menu. Every row
+/// goes through here once, when it is added to the sidebar, so no creation path can leave a row
+/// without them.
+pub fn wire_row(row: &gtk4::ListBoxRow, ws_id: u64) {
+    set_row_workspace_id(row, ws_id);
+
     let close_btn = row
         .child()
         .and_downcast::<gtk4::Box>()
         .and_then(|hbox| hbox.last_child())
-        .and_downcast::<gtk4::Button>();
-
+        .and_then(|w| w.downcast::<gtk4::Button>().ok());
     if let Some(btn) = close_btn {
-        btn.connect_clicked({
-            let state = state.clone();
-            let app = app.clone();
-            let row = row.clone();
-            move |_| {
-                let index = row.index() as usize;
-                let ws_count = state.borrow().workspaces.len();
-                if ws_count <= 1 {
-                    return; // Cannot close last workspace
-                }
-                // Switch to this workspace first (so close_workspace operates on the right one)
-                state.borrow_mut().switch_to_index(index);
-                crate::shortcuts::handle_close_workspace(&state, &app);
-            }
+        btn.connect_clicked(move |_| {
+            // Closes this row's workspace, after the usual confirmation.
+            with_state(move |state| {
+                let app = state.borrow().gtk_app.clone();
+                crate::shortcuts::confirm_close_workspace(state, &app, ws_id);
+            });
         });
     }
-}
 
-/// Attach right-click context menu to a sidebar row (D-03).
-pub fn attach_sidebar_context_menu(
-    row: &gtk4::ListBoxRow,
-    state: Rc<RefCell<crate::app_state::AppState>>,
-) {
     let menu_model = crate::menus::build_sidebar_context_menu();
     let popover = gtk4::PopoverMenu::from_model(Some(&menu_model));
     popover.set_parent(row);
@@ -235,12 +235,9 @@ pub fn attach_sidebar_context_menu(
     gesture.set_button(3); // Right-click
     gesture.connect_released({
         let popover = popover.clone();
-        let state = state.clone();
-        let row = row.clone();
         move |_, _, x, y| {
-            // Switch to this workspace first so context menu actions apply to it
-            let index = row.index() as usize;
-            state.borrow_mut().switch_to_index(index);
+            // Select this workspace first so the menu actions apply to it.
+            defer(move |s| s.select_workspace_by_id(ws_id));
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
                 x as i32, y as i32, 1, 1,
             )));
@@ -248,20 +245,4 @@ pub fn attach_sidebar_context_menu(
         }
     });
     row.add_controller(gesture);
-}
-
-/// Wire close button + context menu to the most recently added sidebar row.
-pub fn wire_latest_row(
-    sidebar_list: &gtk4::ListBox,
-    state: Rc<RefCell<crate::app_state::AppState>>,
-    app: &gtk4::Application,
-) {
-    let n = sidebar_list.observe_children().n_items();
-    if n == 0 {
-        return;
-    }
-    if let Some(row) = sidebar_list.row_at_index((n - 1) as i32) {
-        wire_row_close_button(&row, state.clone(), app);
-        attach_sidebar_context_menu(&row, state);
-    }
 }

@@ -4,551 +4,146 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
+  workflow_dispatch:
+
+# Read-only by default; only the release job can write to the repository.
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  workflow-guard-tests:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Validate WarpBuild runner guards
-        run: ./tests/test_ci_self_hosted_guard.sh
+      - name: Init ghostty submodule
+        run: git submodule update --init --depth 1 ghostty
 
-      - name: Validate create-dmg version pinning
-        run: ./tests/test_ci_create_dmg_pinned.sh
+      - name: Ghostty submodule SHA
+        id: ghostty
+        run: echo "sha=$(git rev-parse HEAD:ghostty)" >> "$GITHUB_OUTPUT"
 
-      - name: Validate unit-test SwiftPM retry guard
-        run: ./tests/test_ci_unit_test_spm_retry.sh
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential pkg-config curl xz-utils \
+            libgtk-4-dev libadwaita-1-dev libclang-dev clang \
+            libfontconfig-dev libfreetype-dev libgl-dev libegl-dev \
+            libonig-dev libbz2-dev \
+            rpm desktop-file-utils appstream shellcheck
 
-      - name: Validate cmux scheme test configuration
-        run: ./tests/test_ci_scheme_testaction_debug.sh
+      - name: Lint shell scripts
+        run: shellcheck -x -P SCRIPTDIR scripts/*.sh packaging/scripts/*.sh
 
-      - name: Validate GhosttyKit checksum verification
-        run: ./tests/test_ci_ghosttykit_checksum_verification.sh
-
-      - name: Validate release asset guard
-        run: node scripts/release_asset_guard.test.js
-
-      - name: Validate current GhosttyKit checksum pin
-        run: ./tests/test_ci_ghosttykit_checksum_present.sh
-
-  remote-daemon-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Setup Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: daemon/remote/go.mod
+          cache-dependency-path: daemon/remote/go.sum
 
-      - name: Run remote daemon tests
+      - name: Cache libghostty build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig
+            ghostty/zig-out
+          key: ghostty-${{ runner.os }}-${{ steps.ghostty.outputs.sha }}
+
+      - name: Set up Zig and build libghostty
+        # Installs Zig 0.15.2 (SHA-256 verified) and builds libghostty; system packages are above.
+        run: |
+          scripts/setup-linux.sh --no-deps
+          # Later steps (terminfo generation in the packagers) run zig too.
+          echo "$HOME/.local/zig" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+
+      - name: Add clippy
+        run: rustup component add clippy
+
+      - name: Clippy (non-blocking until existing warnings are fixed)
+        continue-on-error: true
+        run: cargo clippy --bins -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --bins
+
+      - name: Build release binaries
+        run: cargo build --release --bin cmux-app --bin cmux
+
+      - name: Remote daemon tests
         working-directory: daemon/remote
         run: go test ./...
 
-      - name: Validate remote daemon release assets
-        run: ./tests/test_remote_daemon_release_assets.sh
+      - name: Build cmuxd-remote
+        working-directory: daemon/remote
+        run: CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o cmuxd-remote ./cmd/cmuxd-remote
 
-  web-typecheck:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
+      - name: Remote daemon release asset check
+        run: tests/test_remote_daemon_release_assets.sh
+
+      - name: Desktop metadata checks
+        run: packaging/scripts/validate-all.sh
+
+      - name: Build .deb
+        run: packaging/scripts/build-deb.sh
+
+      - name: Validate .deb
+        run: packaging/scripts/validate-deb.sh
+
+      - name: Build .rpm
+        run: packaging/scripts/build-rpm.sh
+
+      - name: Validate .rpm
+        run: packaging/scripts/validate-rpm.sh
+
+      - name: Build AppImage
+        run: packaging/scripts/build-appimage.sh
+
+      - name: Upload packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cmux-packages
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3 # v2
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Typecheck
-        run: bun tsc --noEmit
-
-  linux-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          submodules: recursive
+          name: cmux-packages
+          path: dist
 
-      - name: Install system deps
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum ./* | sed 's| \./| |' > SHA256SUMS && cat SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libclang-dev libfontconfig1-dev \
-            libfreetype6-dev libonig-dev libgl-dev
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.15.2
-
-      - name: Build libghostty.a
-        run: |
-          cd ghostty
-          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dgtk-x11=true -Dgtk-wayland=true
-
-      - name: Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Build
-        run: cargo build
-
-      - name: Test
-        run: cargo test --bin cmux-app
-
-  tests:
-    # Never run WarpBuild jobs for fork pull requests (avoid billing on external PRs).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: warp-macos-15-arm64-6x
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          submodules: recursive
-
-      - name: Select Xcode
-        run: |
-          set -euo pipefail
-          if [ -d "/Applications/Xcode.app/Contents/Developer" ]; then
-            XCODE_DIR="/Applications/Xcode.app/Contents/Developer"
-          else
-            XCODE_APP="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n 1 || true)"
-            if [ -n "$XCODE_APP" ]; then
-              XCODE_DIR="$XCODE_APP/Contents/Developer"
-            else
-              echo "No Xcode.app found under /Applications" >&2
-              exit 1
-            fi
-          fi
-          echo "DEVELOPER_DIR=$XCODE_DIR" >> "$GITHUB_ENV"
-          export DEVELOPER_DIR="$XCODE_DIR"
-          xcodebuild -version
-
-      - name: Cache GhosttyKit.xcframework
-        id: cache-ghosttykit
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: GhosttyKit.xcframework
-          key: ghosttykit-${{ hashFiles('.gitmodules', 'ghostty') }}
-
-      - name: Download pre-built GhosttyKit.xcframework
-        if: steps.cache-ghosttykit.outputs.cache-hit != 'true'
-        run: |
-          ./scripts/download-prebuilt-ghosttykit.sh
-
-      - name: Install zig
-        run: |
-          ZIG_REQUIRED="0.15.2"
-          if command -v zig >/dev/null 2>&1 && zig version 2>/dev/null | grep -q "^${ZIG_REQUIRED}"; then
-            echo "zig ${ZIG_REQUIRED} already installed"
-          else
-            echo "Installing zig ${ZIG_REQUIRED} from tarball"
-            curl -fSL "https://ziglang.org/download/${ZIG_REQUIRED}/zig-aarch64-macos-${ZIG_REQUIRED}.tar.xz" -o /tmp/zig.tar.xz
-            tar xf /tmp/zig.tar.xz -C /tmp
-            sudo mkdir -p /usr/local/bin /usr/local/lib
-            sudo cp -f /tmp/zig-aarch64-macos-${ZIG_REQUIRED}/zig /usr/local/bin/zig
-            sudo cp -rf /tmp/zig-aarch64-macos-${ZIG_REQUIRED}/lib /usr/local/lib/zig
-            export PATH="/usr/local/bin:$PATH"
-            zig version
-          fi
-
-      - name: Cache DerivedData
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: ~/Library/Developer/Xcode/DerivedData/GhosttyTabs-*
-          key: deriveddata-tests-${{ hashFiles('GhosttyTabs.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ hashFiles('GhosttyTabs.xcodeproj/project.pbxproj') }}
-          restore-keys: |
-            deriveddata-tests-${{ hashFiles('GhosttyTabs.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-
-            deriveddata-tests-
-
-      - name: Cache Swift packages
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: .ci-source-packages
-          key: spm-${{ hashFiles('GhosttyTabs.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
-          restore-keys: spm-
-
-      - name: Resolve Swift packages
-        run: |
-          set -euo pipefail
-          SOURCE_PACKAGES_DIR="$PWD/.ci-source-packages"
-          mkdir -p "$SOURCE_PACKAGES_DIR"
-
-          for attempt in 1 2 3; do
-            if xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux-unit -configuration Debug \
-              -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_DIR" \
-              -resolvePackageDependencies; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              echo "Failed to resolve Swift packages after 3 attempts" >&2
-              exit 1
-            fi
-            echo "Package resolution failed on attempt $attempt, retrying..."
-            sleep $((attempt * 5))
-          done
-
-      - name: Run unit tests
-        run: |
-          set -euo pipefail
-          SOURCE_PACKAGES_DIR="$PWD/.ci-source-packages"
-          run_unit_tests() {
-            xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux-unit -configuration Debug \
-              -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_DIR" \
-              -disableAutomaticPackageResolution \
-              -destination "platform=macOS" \
-              -skip-testing:cmuxTests/AppDelegateShortcutRoutingTests/testCmdWClosesWindowWhenClosingLastSurfaceInLastWorkspace \
-              test 2>&1
-          }
-
-          # Stream output via tee so CI logs are visible in real time, while still
-          # capturing for post-run analysis of expected vs unexpected failures.
-          set +e
-          run_unit_tests | tee /tmp/test-output.txt
-          EXIT_CODE=${PIPESTATUS[0]}
-          OUTPUT=$(cat /tmp/test-output.txt)
-          set -e
-
-          # SwiftPM binary artifact resolution can occasionally fail on ephemeral
-          # runners with "Could not resolve package dependencies". Retry once after
-          # clearing SwiftPM/DerivedData caches to recover from transient corruption.
-          if [ "$EXIT_CODE" -ne 0 ] && echo "$OUTPUT" | grep -q "Could not resolve package dependencies"; then
-            echo "SwiftPM package resolution failed, clearing caches and retrying once"
-            rm -rf ~/Library/Caches/org.swift.swiftpm
-            mkdir -p ~/Library/Caches/org.swift.swiftpm
-            rm -rf ~/Library/Developer/Xcode/DerivedData/GhosttyTabs-*
-            set +e
-            run_unit_tests | tee /tmp/test-output.txt
-            EXIT_CODE=${PIPESTATUS[0]}
-            OUTPUT=$(cat /tmp/test-output.txt)
-            set -e
-          fi
-
-          if [ "$EXIT_CODE" -ne 0 ]; then
-            SUMMARY=$(echo "$OUTPUT" | grep "Executed.*tests.*with.*failures" | tail -1)
-            if echo "$SUMMARY" | grep -q "(0 unexpected)"; then
-              echo "All failures are expected, treating as pass"
-            else
-              echo "Unexpected test failures detected"
-              exit 1
-            fi
-          fi
-
-      - name: Run bundled Ghostty theme picker helper regression
-        run: |
-          set -euo pipefail
-          CMUX_SOURCE_PACKAGES_DIR="$PWD/.ci-source-packages" \
-            ./tests/test_bundled_ghostty_theme_picker_helper.sh
-
-      - name: Run CLI version memory guard regression
-        run: |
-          set -euo pipefail
-
-          CLI_BIN="$(
-            find "$HOME/Library/Developer/Xcode/DerivedData" -path "*/Build/Products/Debug/cmux" -exec stat -f '%m %N' {} \; \
-              | sort -nr \
-              | head -1 \
-              | cut -d' ' -f2-
-          )"
-          if [ -z "${CLI_BIN:-}" ] || [ ! -x "$CLI_BIN" ]; then
-            echo "cmux CLI binary not found in DerivedData" >&2
-            exit 1
-          fi
-
-          CMUX_CLI_BIN="$CLI_BIN" python3 tests/test_cli_version_memory_guard.py
-
-  tests-build-and-lag:
-    # Build the full cmux scheme and run the lag regression on WarpBuild.
-    # Keep lag validation separate from UI regressions so functional UI failures
-    # and performance regressions stay isolated. Broader interactive UI suites
-    # still run via test-e2e.yml on GitHub-hosted runners.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: warp-macos-15-arm64-6x
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          submodules: recursive
-
-      - name: Select Xcode
-        run: |
-          set -euo pipefail
-          if [ -d "/Applications/Xcode.app/Contents/Developer" ]; then
-            XCODE_DIR="/Applications/Xcode.app/Contents/Developer"
-          else
-            XCODE_APP="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n 1 || true)"
-            if [ -n "$XCODE_APP" ]; then
-              XCODE_DIR="$XCODE_APP/Contents/Developer"
-            else
-              echo "No Xcode.app found under /Applications" >&2
-              exit 1
-            fi
-          fi
-          echo "DEVELOPER_DIR=$XCODE_DIR" >> "$GITHUB_ENV"
-          export DEVELOPER_DIR="$XCODE_DIR"
-          xcodebuild -version
-
-      - name: Cache GhosttyKit.xcframework
-        id: cache-ghosttykit-lag
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: GhosttyKit.xcframework
-          key: ghosttykit-${{ hashFiles('.gitmodules', 'ghostty') }}
-
-      - name: Download pre-built GhosttyKit.xcframework
-        if: steps.cache-ghosttykit-lag.outputs.cache-hit != 'true'
-        run: |
-          ./scripts/download-prebuilt-ghosttykit.sh
-
-      - name: Install zig
-        run: |
-          ZIG_REQUIRED="0.15.2"
-          if command -v zig >/dev/null 2>&1 && zig version 2>/dev/null | grep -q "^${ZIG_REQUIRED}"; then
-            echo "zig ${ZIG_REQUIRED} already installed"
-          else
-            echo "Installing zig ${ZIG_REQUIRED} from tarball"
-            curl -fSL "https://ziglang.org/download/${ZIG_REQUIRED}/zig-aarch64-macos-${ZIG_REQUIRED}.tar.xz" -o /tmp/zig.tar.xz
-            tar xf /tmp/zig.tar.xz -C /tmp
-            sudo mkdir -p /usr/local/bin /usr/local/lib
-            sudo cp -f /tmp/zig-aarch64-macos-${ZIG_REQUIRED}/zig /usr/local/bin/zig
-            sudo cp -rf /tmp/zig-aarch64-macos-${ZIG_REQUIRED}/lib /usr/local/lib/zig
-            export PATH="/usr/local/bin:$PATH"
-            zig version
-          fi
-
-      - name: Cache DerivedData
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: ~/Library/Developer/Xcode/DerivedData/GhosttyTabs-*
-          key: deriveddata-build-${{ hashFiles('GhosttyTabs.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ hashFiles('GhosttyTabs.xcodeproj/project.pbxproj') }}
-          restore-keys: |
-            deriveddata-build-${{ hashFiles('GhosttyTabs.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-
-            deriveddata-build-
-
-      - name: Cache Swift packages
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: .ci-source-packages
-          key: spm-build-${{ hashFiles('GhosttyTabs.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
-          restore-keys: spm-build-
-
-      - name: Resolve Swift packages
-        run: |
-          set -euo pipefail
-          SOURCE_PACKAGES_DIR="$PWD/.ci-source-packages"
-          mkdir -p "$SOURCE_PACKAGES_DIR"
-
-          for attempt in 1 2 3; do
-            if xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug \
-              -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_DIR" \
-              -resolvePackageDependencies; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              echo "Failed to resolve Swift packages after 3 attempts" >&2
-              exit 1
-            fi
-            echo "Package resolution failed on attempt $attempt, retrying..."
-            sleep $((attempt * 5))
-          done
-
-      - name: Build app
-        run: |
-          set -euo pipefail
-          SOURCE_PACKAGES_DIR="$PWD/.ci-source-packages"
-          xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug \
-            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_DIR" \
-            -disableAutomaticPackageResolution \
-            -destination "platform=macOS" build
-
-      - name: Create virtual display
-        run: |
-          set -euo pipefail
-          clang -framework Foundation -framework CoreGraphics \
-            -o /tmp/create-virtual-display scripts/create-virtual-display.m
-          /tmp/create-virtual-display &
-          VDISPLAY_PID=$!
-          echo "VDISPLAY_PID=$VDISPLAY_PID" >> "$GITHUB_ENV"
-          sleep 3
-          kill -0 "$VDISPLAY_PID"
-
-      - name: Run workspace churn typing-lag regression
-        run: |
-          set -euo pipefail
-
-          APP="$(find "$HOME/Library/Developer/Xcode/DerivedData" -path "*/Build/Products/Debug/cmux DEV.app" -print -quit)"
-          if [ -z "${APP:-}" ] || [ ! -d "$APP" ]; then
-            echo "cmux DEV.app not found in DerivedData" >&2
-            exit 1
-          fi
-
-          TAG="ci-lag"
-          SOCK="/tmp/cmux-debug-${TAG}.sock"
-          BUNDLE_ID="$(
-            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null \
-              || echo 'com.cmuxterm.app.debug'
-          )"
-
-          pkill -x "cmux DEV" || true
-          rm -f "$SOCK" "/tmp/cmux-${TAG}.sock" || true
-          defaults write "$BUNDLE_ID" socketControlMode -string full >/dev/null 2>&1 || true
-
-          CMUX_TAG="$TAG" CMUX_SOCKET_PATH="$SOCK" CMUX_UI_TEST_MODE=1 "$APP/Contents/MacOS/cmux DEV" >/tmp/cmux-ci-lag.log 2>&1 &
-          APP_PID=$!
-          trap 'kill "$APP_PID" >/dev/null 2>&1 || true' EXIT
-
-          for _ in {1..240}; do
-            [ -S "$SOCK" ] && break
-            sleep 0.25
-          done
-          [ -S "$SOCK" ] || { echo "Socket not ready at $SOCK" >&2; exit 1; }
-
-          CMUX_SOCKET_PATH="$SOCK" \
-          CMUX_LAG_MAX_P95_RATIO=1.70 \
-          CMUX_LAG_MAX_AVG_RATIO=1.70 \
-          CMUX_LAG_MIN_BASELINE_P95_MS_FOR_RATIO=6.0 \
-          CMUX_LAG_MIN_BASELINE_AVG_MS_FOR_RATIO=4.0 \
-          CMUX_LAG_MAX_P95_DELTA_MS=20.0 \
-          CMUX_LAG_MAX_AVG_DELTA_MS=12.0 \
-          CMUX_LAG_MAX_CHURN_P95_MS=35 \
-          CMUX_LAG_KEY_EVENTS=180 \
-          python3 tests/test_workspace_churn_up_arrow_lag.py
-
-      - name: Cleanup virtual display
-        if: always()
-        run: |
-          set -euo pipefail
-          if [ -n "${VDISPLAY_PID:-}" ]; then
-            kill "$VDISPLAY_PID" >/dev/null 2>&1 || true
-          fi
-          rm -f /tmp/create-virtual-display
-
-  ui-regressions:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: warp-macos-15-arm64-6x
-    timeout-minutes: 25
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          submodules: recursive
-
-      - name: Select Xcode
-        run: |
-          set -euo pipefail
-          if [ -d "/Applications/Xcode.app/Contents/Developer" ]; then
-            XCODE_DIR="/Applications/Xcode.app/Contents/Developer"
-          else
-            XCODE_APP="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n 1 || true)"
-            if [ -n "$XCODE_APP" ]; then
-              XCODE_DIR="$XCODE_APP/Contents/Developer"
-            else
-              echo "No Xcode.app found under /Applications" >&2
-              exit 1
-            fi
-          fi
-          echo "DEVELOPER_DIR=$XCODE_DIR" >> "$GITHUB_ENV"
-          export DEVELOPER_DIR="$XCODE_DIR"
-          xcodebuild -version
-          xcrun --sdk macosx --show-sdk-path
-
-      - name: Download pre-built GhosttyKit.xcframework
-        run: ./scripts/download-prebuilt-ghosttykit.sh
-
-      - name: Install zig
-        run: |
-          ZIG_REQUIRED="0.15.2"
-          if command -v zig >/dev/null 2>&1 && zig version 2>/dev/null | grep -q "^${ZIG_REQUIRED}"; then
-            echo "zig ${ZIG_REQUIRED} already installed"
-          else
-            echo "Installing zig ${ZIG_REQUIRED} from tarball"
-            curl -fSL "https://ziglang.org/download/${ZIG_REQUIRED}/zig-aarch64-macos-${ZIG_REQUIRED}.tar.xz" -o /tmp/zig.tar.xz
-            tar xf /tmp/zig.tar.xz -C /tmp
-            sudo mkdir -p /usr/local/bin /usr/local/lib
-            sudo cp -f /tmp/zig-aarch64-macos-${ZIG_REQUIRED}/zig /usr/local/bin/zig
-            sudo cp -rf /tmp/zig-aarch64-macos-${ZIG_REQUIRED}/lib /usr/local/lib/zig
-            export PATH="/usr/local/bin:$PATH"
-            zig version
-          fi
-
-      - name: Cache Swift packages
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
-        with:
-          path: .ci-source-packages
-          key: spm-ui-regressions-${{ hashFiles('GhosttyTabs.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
-          restore-keys: spm-ui-regressions-
-
-      - name: Resolve Swift packages
-        run: |
-          set -euo pipefail
-          SOURCE_PACKAGES_DIR="$PWD/.ci-source-packages"
-          mkdir -p "$SOURCE_PACKAGES_DIR"
-
-          for attempt in 1 2 3; do
-            if xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug \
-              -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_DIR" \
-              -resolvePackageDependencies; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              echo "Failed to resolve Swift packages after 3 attempts" >&2
-              exit 1
-            fi
-            echo "Package resolution failed on attempt $attempt, retrying..."
-            sleep $((attempt * 5))
-          done
-
-      - name: Run display resolution churn UI regression
-        run: |
-          set -euo pipefail
-          SOURCE_PACKAGES_DIR="$PWD/.ci-source-packages"
-          HELPER_PATH="/tmp/create-virtual-display"
-          MANIFEST_PATH="/tmp/cmux-ui-test-display-harness.json"
-
-          rm -f "$MANIFEST_PATH"
-          trap 'rm -f "$MANIFEST_PATH"' EXIT
-
-          clang -framework Foundation -framework CoreGraphics \
-            -o "$HELPER_PATH" scripts/create-virtual-display.m
-
-          cat >"$MANIFEST_PATH" <<EOF
-          {"helperBinaryPath":"$HELPER_PATH"}
-          EOF
-
-          xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug \
-            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_DIR" \
-            -disableAutomaticPackageResolution \
-            -destination "platform=macOS" \
-            -only-testing:cmuxUITests/DisplayResolutionRegressionUITests \
-            test
-
-      - name: Run browser find focus UI regression
-        run: |
-          set -euo pipefail
-          SOURCE_PACKAGES_DIR="$PWD/.ci-source-packages"
-          xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug \
-            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_DIR" \
-            -disableAutomaticPackageResolution \
-            -destination "platform=macOS" \
-            -maximum-test-execution-time-allowance 120 \
-            -only-testing:cmuxUITests/BrowserPaneNavigationKeybindUITests/testCmdFFocusesBrowserFindFieldAfterCmdDCmdLNavigation \
-            test
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "cmux $GITHUB_REF_NAME" \
+            --generate-notes

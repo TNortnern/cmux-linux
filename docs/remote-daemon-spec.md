@@ -78,14 +78,7 @@ This is a **living implementation spec** (also called an **execution spec**): a 
 4. `DONE` browser panels in local workspaces are not force-proxied.
 5. `DONE` identical SSH transports share one endpoint via a transport-scoped broker.
 
-### 4.2 WKWebView Wiring
-1. `DONE` use workspace-scoped `WKWebsiteDataStore(forIdentifier:)`.
-2. `DONE` apply workspace/browser scoped `proxyConfigurations`.
-3. `DONE` prefer SOCKS5 proxy config.
-4. `DONE` keep HTTP CONNECT proxy config as fallback.
-5. `DONE` re-apply proxy config on reconnect/state updates.
-
-### 4.3 Remote Daemon + Transport
+### 4.2 Remote Daemon + Transport
 1. `DONE` `cmuxd-remote` now supports proxy stream RPC (`proxy.open`, `proxy.close`, `proxy.write`, `proxy.stream.subscribe`) with pushed `proxy.stream.data/eof/error` events.
 2. `DONE` local side now runs a shared local broker that serves SOCKS5/CONNECT and tunnels each stream over persistent daemon stdio RPC without polling reads.
 3. `DONE` removed remote service-port discovery/probing from browser routing path.

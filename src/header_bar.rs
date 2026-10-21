@@ -14,14 +14,14 @@ pub fn build_header_bar(config: &crate::config::Config) -> Option<gtk4::HeaderBa
 
     // [+] New Workspace (D-05)
     let new_ws_btn = gtk4::Button::from_icon_name("tab-new-symbolic");
-    new_ws_btn.set_tooltip_text(Some("New Workspace (Ctrl+N)"));
+    new_ws_btn.set_tooltip_text(Some("New Workspace (Ctrl+Shift+N)"));
     new_ws_btn.set_action_name(Some("win.new-workspace"));
     new_ws_btn.add_css_class("headerbar-btn");
     header.pack_start(&new_ws_btn);
 
     // [Browser] New Browser (D-05, D-07)
     let browser_btn = gtk4::Button::from_icon_name("web-browser-symbolic");
-    browser_btn.set_tooltip_text(Some("New Browser (Ctrl+Shift+B)"));
+    browser_btn.set_tooltip_text(Some("New Browser (Ctrl+Alt+B)"));
     browser_btn.set_action_name(Some("win.browser-open"));
     browser_btn.add_css_class("headerbar-btn");
     header.pack_start(&browser_btn);
@@ -40,21 +40,21 @@ pub fn build_header_bar(config: &crate::config::Config) -> Option<gtk4::HeaderBa
 
     // Toggle Sidebar (D-05) — second from right
     let sidebar_btn = gtk4::Button::from_icon_name("sidebar-show-symbolic");
-    sidebar_btn.set_tooltip_text(Some("Toggle Sidebar (Ctrl+B)"));
+    sidebar_btn.set_tooltip_text(Some("Toggle Sidebar (Ctrl+Shift+B)"));
     sidebar_btn.set_action_name(Some("win.toggle-sidebar"));
     sidebar_btn.add_css_class("headerbar-btn");
     header.pack_end(&sidebar_btn);
 
     // Split Vertical / Split Down (D-05)
     let split_v_btn = gtk4::Button::from_icon_name("object-flip-vertical-symbolic");
-    split_v_btn.set_tooltip_text(Some("Split Down (Ctrl+Shift+D)"));
+    split_v_btn.set_tooltip_text(Some("Split Down (Alt+Shift+-)"));
     split_v_btn.set_action_name(Some("win.split-down"));
     split_v_btn.add_css_class("headerbar-btn");
     header.pack_end(&split_v_btn);
 
     // Split Horizontal / Split Right (D-05)
     let split_h_btn = gtk4::Button::from_icon_name("view-dual-symbolic");
-    split_h_btn.set_tooltip_text(Some("Split Right (Ctrl+D)"));
+    split_h_btn.set_tooltip_text(Some("Split Right (Alt+Shift+=)"));
     split_h_btn.set_action_name(Some("win.split-right"));
     split_h_btn.add_css_class("headerbar-btn");
     header.pack_end(&split_h_btn);

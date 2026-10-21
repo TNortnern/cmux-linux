@@ -181,7 +181,9 @@ pub unsafe extern "C" fn ssh_io_write_cb(
 
     let bytes = std::slice::from_raw_parts(data as *const u8, len);
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    if let Some(ref stream_id) = *ctx.stream_id.lock().unwrap() {
+    // A poisoned lock must not panic across the FFI boundary; the Option inside is still valid.
+    let stream_id = ctx.stream_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(ref stream_id) = *stream_id {
         let _ = ctx.write_tx.send(WriteRequest {
             stream_id: stream_id.clone(),
             data_base64: b64,

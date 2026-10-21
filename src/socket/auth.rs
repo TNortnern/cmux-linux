@@ -20,13 +20,25 @@ pub fn validate_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<boo
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let expected_uid = unsafe { libc::getuid() };
-    Ok(cred.uid == expected_uid)
+    Ok(uid_matches(cred.uid, unsafe { libc::getuid() }))
+}
+
+/// True when `uid` is the expected (our own) UID. Pure so the rule is unit-testable.
+pub fn uid_matches(uid: u32, expected_uid: u32) -> bool {
+    uid == expected_uid
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer with a different UID is rejected, even when it is a valid cmux user.
+    #[test]
+    fn test_different_uid_rejected() {
+        assert!(!uid_matches(1001, 1000));
+        assert!(!uid_matches(0, 1000), "root peer must not bypass the check");
+        assert!(uid_matches(1000, 1000));
+    }
 
     /// SOCK-06: validate_peer_uid uses SO_PEERCRED to check connection UID.
     /// A Unix socketpair has the same UID on both ends, so this verifies

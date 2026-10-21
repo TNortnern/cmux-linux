@@ -1,13 +1,20 @@
 
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, gio, CssProvider, StyleContext};
+use gtk4::{Application, ApplicationWindow, gio, CssProvider};
+use std::cell::RefCell;
 use std::ffi::CString;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 
+// Must come first: the macros are used by every module below.
+#[macro_use]
+mod log;
 mod ghostty;
 mod workspace;
 mod split_engine;
 mod app_state;
 mod sidebar;
+mod tab_bar;
 mod shortcuts;
 mod socket;
 mod session;
@@ -19,7 +26,31 @@ mod header_bar;
 mod ssh_hosts;
 mod ssh_dialog;
 
-const APP_ID: &str = "io.cmux.App";
+/// Matches the desktop file, icon and metainfo, so the window links to its launcher entry.
+const APP_ID: &str = "com.cmux_lx.terminal";
+
+/// cmux's ghostty defaults. They are loaded before ~/.config/ghostty/config, which overrides them.
+/// `scrollback-limit` is prepended from [terminal] in config.toml.
+const GHOSTTY_DEFAULTS: &str = "\
+# cmux defaults. The user's ~/.config/ghostty/config is loaded after this file.
+# OSC 52 lets terminal output write the clipboard, but reading it is denied.
+clipboard-read = deny
+clipboard-write = allow
+# cmux owns the app shortcuts. Ghostty's own defaults would swallow keys such
+# as Ctrl+Shift+T, so clear them and bind only what cmux needs.
+keybind = clear
+keybind = ctrl+shift+c=copy_to_clipboard
+keybind = ctrl+shift+v=paste_from_clipboard
+keybind = shift+insert=paste_from_selection
+keybind = ctrl+shift+a=select_all
+keybind = shift+page_up=scroll_page_up
+keybind = shift+page_down=scroll_page_down
+keybind = ctrl+shift+home=scroll_to_top
+keybind = ctrl+shift+end=scroll_to_bottom
+keybind = ctrl+equal=increase_font_size:1
+keybind = ctrl+minus=decrease_font_size:1
+keybind = ctrl+zero=reset_font_size
+";
 
 const APP_CSS: &str = "
 /* cmux Phase 2 styles — per UI-SPEC.md */
@@ -95,11 +126,58 @@ popover.menu { background-color: #2a2a2a; border: 1px solid #3a3a3a; border-radi
 popover.menu modelbutton { padding: 8px 16px; color: #cccccc; font-size: 14px; }
 popover.menu modelbutton:hover { background-color: #3a3a3a; }
 popover.menu accelerator { color: #5b8dd9; font-size: 12px; }
+/* Tab bar above each workspace's splits */
+.tab-bar { background-color: #1f1f1f; border-bottom: 1px solid #3a3a3a; }
+.tab-strip { background-color: transparent; }
+.tab { min-height: 28px; padding: 2px 4px 2px 12px; color: #999999; font-size: 13px; border-bottom: 2px solid transparent; }
+.tab:hover { background-color: #2a2a2a; }
+.tab.tab-active { background-color: #2e2e2e; color: #ffffff; border-bottom-color: #5b8dd9; }
+.tab-close { min-width: 18px; min-height: 18px; padding: 0; margin: 0; background-color: transparent; color: #888888; border: none; }
+.tab-close:hover { color: #cccccc; }
+.tab-add { min-width: 28px; min-height: 28px; padding: 0; margin: 0 4px; background-color: transparent; color: #cccccc; border: none; }
+.tab-add:hover { background-color: #2e2e2e; }
+.tab-rename { font-size: 13px; padding: 0 4px; }
 ";
 
 fn main() {
-    // Tokio runtime for socket I/O (kept alive for app lifetime).
-    let runtime = tokio::runtime::Runtime::new()
+    // Nothing below may spawn a thread before the runtime is built. The env
+    // changes and mallopt call are only sound while the process is single-threaded.
+
+    // glibc creates up to 8 malloc arenas per core, one per thread that allocates.
+    // Every pane adds ghostty threads, so the default inflates RSS. Cap the count.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
+    // Config is read before the runtime exists so that the runtime, the session
+    // restore and ghostty's setup can all use it.
+    let config = crate::config::load_config();
+
+    // Rendering defaults that only matter without a GPU (see UiConfig::renderer). Respect the
+    // user's own environment. Still single-threaded here, so set_var is sound.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        let has_gpu_node = std::fs::read_dir("/dev/dri")
+            .map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().starts_with("renderD")))
+            .unwrap_or(false);
+        if crate::config::use_cairo_renderer(&config.ui.renderer, has_gpu_node) {
+            std::env::set_var("GSK_RENDERER", "cairo");
+        }
+    }
+    // Mesa's software rasterizer (llvmpipe) starts one thread per core by default; two keep a
+    // terminal smooth. No effect on hardware drivers.
+    if std::env::var_os("LP_NUM_THREADS").is_none() {
+        std::env::set_var("LP_NUM_THREADS", "2");
+    }
+    resolve_ghostty_resources_dir();
+
+    // Socket I/O, session saves and ssh tunnels need only a few workers. The GTK main
+    // thread does the UI work, so extra workers would just cost memory.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(4)
+        .thread_name("cmux-rt")
+        .enable_all()
+        .build()
         .expect("Failed to create tokio runtime");
     let runtime_handle = runtime.handle().clone();
 
@@ -115,13 +193,17 @@ fn main() {
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
-    eprintln!("cmux: GtkApplication created, connecting activate signal");
+    cmux_debug!("GtkApplication created, connecting activate signal");
 
-    // Try to restore session from previous run (SESS-02, SESS-04).
-    // load_session() returns None if file is missing or invalid -- that's fine.
-    let saved_session = crate::session::load_session();
+    // Restore the previous session (SESS-02, SESS-04) unless [session] restore = false.
+    // load_session() returns None if the file is missing or invalid -- that's fine.
+    let saved_session = if config.session.restore {
+        crate::session::load_session()
+    } else {
+        None
+    };
     if let Some(ref s) = saved_session {
-        eprintln!("cmux: restoring session ({} workspace(s))", s.workspaces.len());
+        cmux_info!("restoring session ({} workspace(s))", s.workspaces.len());
     }
 
     // Session save infrastructure: Notify for debounce, channel for session snapshots.
@@ -144,17 +226,16 @@ fn main() {
                     latest = Some(data);
                 }
                 if let Some(session) = latest {
-                    if let Err(e) = crate::session::save_session_atomic(&session) {
-                        eprintln!("cmux: session save failed: {e}");
+                    if let Err(e) = crate::session::save_session_debounced(&session) {
+                        cmux_warn!("session save failed: {e}");
                     }
                 }
             }
         });
     }
 
-    // Load config once at startup (D-06). ShortcutMap must be built inside
-    // activate (after GTK init) because accelerator_parse requires GTK.
-    let config = crate::config::load_config();
+    // ShortcutMap must be built inside activate (after GTK init) because
+    // accelerator_parse requires GTK. `config` was loaded at the top of main (D-06).
 
     // Move runtime_handle, cmd_tx, cmd_rx into the activate closure.
     // cmd_rx is wrapped in Mutex<Option<...>> so it can be taken once from a Fn closure.
@@ -172,9 +253,9 @@ fn main() {
         }
     });
 
-    eprintln!("cmux: calling app.run()");
+    cmux_debug!("calling app.run()");
     let _exit_code = app.run();
-    eprintln!("cmux: app.run() returned");
+    cmux_debug!("app.run() returned");
 
     // Runtime drops here — tokio tasks are cancelled.
     drop(runtime);
@@ -192,24 +273,41 @@ fn build_ui(
     config: &crate::config::Config,
 ) {
     // 1. Initialize Ghostty once
+    let defaults_path = match write_ghostty_defaults(config.terminal.scrollback_bytes) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            cmux_warn!("could not write ghostty defaults ({e}); keybinds and clipboard policy are ghostty's own");
+            None
+        }
+    };
+
     let ghostty_app = unsafe {
         use crate::ghostty::ffi;
         use crate::ghostty::callbacks::APP_PTR;
         use std::sync::atomic::Ordering;
 
-        let argv: Vec<CString> = std::env::args().map(|a| CString::new(a).unwrap()).collect();
+        // Args are OS bytes, which may not be UTF-8. An argument with a NUL byte cannot exist.
+        let argv: Vec<CString> = std::env::args_os()
+            .filter_map(|a| CString::new(a.into_vec()).ok())
+            .collect();
         let mut ptrs: Vec<*mut i8> = argv.iter().map(|a| a.as_ptr() as *mut i8).collect();
         ffi::ghostty_init(ptrs.len(), ptrs.as_mut_ptr());
 
         let config = ffi::ghostty_config_new();
-        // CFG-03: Ghostty loads its own config from ~/.config/ghostty/config
+        if let Some(path) = &defaults_path {
+            if let Ok(c) = CString::new(path.as_os_str().as_encoded_bytes()) {
+                ffi::ghostty_config_load_file(config, c.as_ptr());
+            }
+        }
+        // CFG-03: Ghostty loads its own config from ~/.config/ghostty/config.
+        // It loads after the cmux defaults above, so the user's file can override them.
         ffi::ghostty_config_load_default_files(config);
         ffi::ghostty_config_finalize(config);
 
         let runtime_config = ffi::ghostty_runtime_config_s {
             userdata: std::ptr::null_mut(),
             supports_selection_clipboard: true,
-            wakeup_cb: Some(crate::ghostty::callbacks::wakeup_cb),
+            wakeup_cb: Some(wakeup_then_check_bells),
             action_cb: Some(crate::ghostty::callbacks::action_cb),
             read_clipboard_cb: Some(crate::ghostty::surface::read_clipboard_cb),
             confirm_read_clipboard_cb: Some(crate::ghostty::surface::confirm_read_clipboard_cb),
@@ -220,7 +318,7 @@ fn build_ui(
         let ghostty_app = ffi::ghostty_app_new(&runtime_config, config);
         ffi::ghostty_config_free(config);
         if ghostty_app.is_null() {
-            eprintln!("cmux: FATAL — ghostty_app_new returned null");
+            cmux_warn!("fatal: ghostty_app_new returned null");
             std::process::exit(1);
         }
         APP_PTR.store(ghostty_app as usize, Ordering::SeqCst);
@@ -271,7 +369,7 @@ fn build_ui(
     );
 
     // Wire sidebar click-to-switch.
-    crate::sidebar::wire_sidebar_clicks(&sidebar_list, state.clone());
+    crate::sidebar::wire_sidebar_clicks(&sidebar_list);
 
     // Set save_notify, session_tx, and SSH event channel on AppState.
     let (ssh_event_tx, mut ssh_event_rx) = tokio::sync::mpsc::unbounded_channel::<crate::ssh::SshEvent>();
@@ -282,63 +380,18 @@ fn build_ui(
         s.ssh_event_tx = Some(ssh_event_tx);
         s.runtime_handle = Some(runtime_handle.clone());
     }
+    MAIN_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 
-    // Restore session if available (SESS-02), otherwise create default workspace.
+    // Restore the saved workspaces, tabs and splits (SESS-02). Tabs stay lazy: a shell starts
+    // only when its tab is first shown. With no saved session, create the first workspace.
     {
-        let has_session = saved_session.as_ref().map(|s| !s.workspaces.is_empty()).unwrap_or(false);
-        if has_session {
-            let session = saved_session.unwrap();
-            if session.version >= 2 {
-                // Version 2: full tree restore (D-05)
-                let mut restored_count = 0;
-                for ws_session in &session.workspaces {
-                    if state.borrow_mut().restore_workspace(ws_session).is_some() {
-                        restored_count += 1;
-                    } else {
-                        // D-15: tree invalid or too deep, fall back to single pane
-                        eprintln!("cmux: workspace '{}' tree invalid, creating default", ws_session.name);
-                        state.borrow_mut().create_workspace();
-                        state.borrow_mut().rename_active(ws_session.name.clone());
-                    }
-                }
-                eprintln!("cmux: restored {} workspaces from v2 session", restored_count);
-            } else {
-                // Version 1: name-only restore (auto-upgrade on next save per D-01)
-                for ws_session in &session.workspaces {
-                    state.borrow_mut().create_workspace();
-                    state.borrow_mut().rename_active(ws_session.name.clone());
-                }
-            }
-            // Restore active workspace index.
-            let ws_count = state.borrow().workspaces.len();
-            let active = session.active_index.min(ws_count.saturating_sub(1));
-            state.borrow_mut().switch_to_index(active);
-
-            // D-10: After GLAreas realize, sync surface pointers from registry.
-            if session.version >= 2 {
-                let state_for_sync = state.clone();
-                gtk4::glib::idle_add_local_once(move || {
-                    let mut s = state_for_sync.borrow_mut();
-                    for engine in &mut s.split_engines {
-                        engine.sync_surfaces_from_registry();
-                    }
-                    eprintln!("cmux: synced surface pointers from registry after restore");
-                });
-            }
-        } else {
-            // No session -- create the default first workspace.
+        let restored = match saved_session {
+            Some(session) => state.borrow_mut().restore_session(&session),
+            None => 0,
+        };
+        cmux_debug!("restored {} workspace(s) from session", restored);
+        if restored == 0 {
             state.borrow_mut().create_workspace();
-        }
-    }
-
-    // Phase 9: Wire close buttons + context menus on all sidebar rows created above.
-    {
-        let n = sidebar_list.observe_children().n_items();
-        for i in 0..n {
-            if let Some(row) = sidebar_list.row_at_index(i as i32) {
-                crate::sidebar::wire_row_close_button(&row, state.clone(), app);
-                crate::sidebar::attach_sidebar_context_menu(&row, state.clone());
-            }
         }
     }
 
@@ -356,117 +409,45 @@ fn build_ui(
         });
     }
 
-    // Phase 4: Process pending bell notifications and SSH events on the GTK main thread.
-    // action_cb sets BELL_PENDING from within ghostty_app_tick (already on main thread).
-    // SSH events arrive via ssh_event_rx from tokio tasks.
+    // Phase 4: bells and SSH events reach the GTK thread without a timer.
+    // Bells are raised inside ghostty_app_tick (see wakeup_then_check_bells).
+    // SSH events come from tokio tasks. Awaiting them on the GLib main context
+    // wakes the GTK thread only when an event is queued.
     {
         let state = state.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-            // Process bell notifications
-            if crate::ghostty::callbacks::BELL_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                let pane_id = crate::ghostty::callbacks::BELL_PANE_ID.load(std::sync::atomic::Ordering::SeqCst);
-                if pane_id != 0 {
-                    state.borrow_mut().set_pane_attention(pane_id);
-                }
+        glib::MainContext::default().spawn_local(async move {
+            while let Some(event) = ssh_event_rx.recv().await {
+                handle_ssh_event(event, &state);
             }
-            // Process SSH events
-            while let Ok(event) = ssh_event_rx.try_recv() {
-                match event {
-                    crate::ssh::SshEvent::StateChanged { workspace_id, state: conn_state } => {
-                        // Auto-save host on successful connection (D-04)
-                        if conn_state == crate::workspace::ConnectionState::Connected {
-                            let remote_target = state.borrow().workspaces.iter()
-                                .find(|ws| ws.id == workspace_id)
-                                .and_then(|ws| ws.remote_target.clone());
-                            if let Some(target) = remote_target {
-                                crate::ssh_hosts::save_host(&target);
-                            }
-                        }
-                        state.borrow_mut().update_connection_state(workspace_id, conn_state);
-                    }
-                    crate::ssh::SshEvent::RemoteOutput { pane_id, data } => {
-                        // Dispatch remote output to the Ghostty surface via process_output.
-                        if let Ok(registry) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                            let surface_ptr = registry.iter()
-                                .find(|(_, &pid)| pid == pane_id)
-                                .map(|(&sptr, _)| sptr as crate::ghostty::ffi::ghostty_surface_t);
-                            if let Some(surface) = surface_ptr {
-                                unsafe {
-                                    crate::ghostty::ffi::ghostty_surface_process_output(
-                                        surface,
-                                        data.as_ptr() as *const _,
-                                        data.len(),
-                                    );
-                                }
-                                // Queue render for the GLArea associated with this surface
-                                if let Ok(gl_areas) = crate::ghostty::callbacks::GL_TO_SURFACE.lock() {
-                                    for (&gl_ptr, &s_ptr) in gl_areas.iter() {
-                                        if s_ptr == surface as usize {
-                                            let area: glib::translate::Borrowed<gtk4::GLArea> =
-                                                unsafe { glib::translate::from_glib_borrow(gl_ptr as *mut gtk4::ffi::GtkGLArea) };
-                                            area.queue_render();
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    crate::ssh::SshEvent::RemoteEof { pane_id } => {
-                        // D-08: write exit message to surface, keep pane open for user to close
-                        if let Ok(registry) = crate::ghostty::callbacks::SURFACE_REGISTRY.lock() {
-                            let surface_ptr = registry.iter()
-                                .find(|(_, &pid)| pid == pane_id)
-                                .map(|(&sptr, _)| sptr as crate::ghostty::ffi::ghostty_surface_t);
-                            if let Some(surface) = surface_ptr {
-                                let msg = b"\r\n\x1b[90m[Remote shell exited. Press any key to close]\x1b[0m\r\n";
-                                unsafe {
-                                    crate::ghostty::ffi::ghostty_surface_process_output(
-                                        surface,
-                                        msg.as_ptr() as *const _,
-                                        msg.len(),
-                                    );
-                                }
-                            }
-                        }
-                        // Clear stream_id and set eof flag so next keypress triggers close
-                        if let Some(ctx) = state.borrow().remote_pane_contexts.get(&pane_id) {
-                            if let Ok(mut sid) = ctx.stream_id.lock() {
-                                *sid = None;
-                            }
-                            ctx.eof_received.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                    crate::ssh::SshEvent::ClosePaneRequest { pane_id } => {
-                        // Find the workspace containing this pane and close it
-                        let ws_index = state.borrow().workspaces.iter().position(|ws| {
-                            ws.id * 1000 == pane_id
-                        });
-                        if let Some(idx) = ws_index {
-                            state.borrow_mut().close_workspace(idx);
-                        }
-                    }
-                    crate::ssh::SshEvent::StreamOpened { pane_id, stream_id } => {
-                        // Set the stream_id on the IoWriteContext so keystrokes start flowing
-                        if let Some(ctx) = state.borrow().remote_pane_contexts.get(&pane_id) {
-                            if let Ok(mut sid) = ctx.stream_id.lock() {
-                                *sid = Some(stream_id);
-                            }
-                        }
-                    }
-                }
-            }
-            glib::ControlFlow::Continue
         });
     }
 
     // Phase 8: Clean up browser daemon on app shutdown.
     // connect_shutdown fires while GTK is still alive and runtime handle is valid,
     // ensuring the daemon gets a clean shutdown command before tokio tasks are cancelled.
+    // The session is written here too, while GTK and the state are still alive.
     {
         let state_for_shutdown = state.clone();
         app.connect_shutdown(move |_| {
-            state_for_shutdown.borrow_mut().shutdown_browser();
+            if let Ok(mut s) = state_for_shutdown.try_borrow_mut() {
+                s.flush_session();
+                s.shutdown_browser();
+            }
+        });
+    }
+
+    // Signals that end the process without a GTK close (kill, terminal hangup, Ctrl+C) save the
+    // layout first, then quit through the normal path. The flush runs on the GLib main loop.
+    for signum in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        let app_for_signal = app.clone();
+        let _ = glib::unix_signal_add_local(signum, move || {
+            // If AppState is busy right now, the flush and the quit wait for a later idle.
+            let app = app_for_signal.clone();
+            crate::app_state::defer(move |s| {
+                s.flush_session();
+                app.quit();
+            });
+            glib::ControlFlow::Break
         });
     }
 
@@ -476,25 +457,13 @@ fn build_ui(
     crate::socket::start_socket_server(&runtime_handle, state.clone(), cmd_tx);
 
     // 5. Handle delete-event for close confirmation
+    // Window close (the X button, or the last window closing) saves the session before it proceeds.
     window.connect_close_request({
         let state = state.clone();
         move |_win| {
-            let count = state.borrow().workspaces.len();
-            if count == 0 {
-                return gtk4::glib::Propagation::Proceed;
+            if let Ok(s) = state.try_borrow() {
+                s.flush_session();
             }
-            // Show close confirmation dialog.
-            // let dialog = gtk4::AlertDialog::builder()
-            //     .message("Close Workspace?")
-            //     .detail("All panes in this workspace will be closed. This cannot be undone.")
-            //     .modal(true)
-            //     .build();
-            // dialog.set_buttons(&["Keep Workspace", "Close Workspace"]);
-            // dialog.set_default_button(0);
-            // dialog.set_cancel_button(0);
-
-            // For window close, just allow it — full per-workspace dialog wired in shortcuts.rs.
-            // This dialog is for the window X button — proceed to close.
             gtk4::glib::Propagation::Proceed
         }
     });
@@ -503,7 +472,7 @@ fn build_ui(
     // Storing sidebar_scroll on the stack is enough for now. Plan 05 will pass it to shortcuts.
 
     // Phase 9: Register GIO actions for menu/button dispatch
-    crate::menus::register_actions(&window, state.clone(), &sidebar_box, app);
+    crate::menus::register_actions(&window, &sidebar_box, app);
     crate::menus::register_accels(app);
 
     // 7. Install keyboard shortcuts (config-driven, D-06)
@@ -511,4 +480,231 @@ fn build_ui(
 
     // 8. Present the window
     window.present();
+}
+
+thread_local! {
+    /// App state, for the GTK main thread only. The bell check runs as a GLib idle,
+    /// which cannot capture the Rc, so it reads the state from here.
+    static MAIN_STATE: RefCell<Option<crate::app_state::AppStateRef>> = const { RefCell::new(None) };
+}
+
+/// Ghostty's wakeup entry point. wakeup_cb queues ghostty_app_tick on the GLib loop,
+/// and bells are raised inside that tick. Queuing check_bells after it replaces the
+/// old 100 ms poll. GLib runs idles of equal priority in FIFO order, so every check
+/// runs after the tick queued before it. The checks must not be coalesced: a skipped
+/// check could run before a later tick that drains the bell.
+unsafe extern "C" fn wakeup_then_check_bells(userdata: *mut std::ffi::c_void) {
+    crate::ghostty::callbacks::wakeup_cb(userdata);
+    glib::idle_add_once(check_bells);
+}
+
+fn check_bells() {
+    use crate::ghostty::callbacks::{BELL_PANE_ID, BELL_PENDING};
+    use std::sync::atomic::Ordering;
+    if !BELL_PENDING.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let pane_id = BELL_PANE_ID.load(Ordering::SeqCst);
+    if pane_id == 0 {
+        return;
+    }
+    MAIN_STATE.with(|s| {
+        if let Some(state) = s.borrow().as_ref() {
+            state.borrow_mut().set_pane_attention(pane_id);
+        }
+    });
+}
+
+/// The Ghostty surface of pane `pane_id`, if it is registered. The registry lock is released
+/// before the caller calls into Ghostty.
+fn surface_for_pane(pane_id: u64) -> Option<crate::ghostty::ffi::ghostty_surface_t> {
+    let registry = crate::ghostty::callbacks::SURFACE_REGISTRY.lock().ok()?;
+    let found = registry.iter().find(|(_, &pid)| pid == pane_id).map(|(&sptr, _)| sptr);
+    drop(registry);
+    found.map(|sptr| sptr as crate::ghostty::ffi::ghostty_surface_t)
+}
+
+/// Applies one SSH event on the GTK main thread.
+fn handle_ssh_event(event: crate::ssh::SshEvent, state: &crate::app_state::AppStateRef) {
+    match event {
+        crate::ssh::SshEvent::StateChanged { workspace_id, state: conn_state } => {
+            // Auto-save host on successful connection (D-04)
+            if conn_state == crate::workspace::ConnectionState::Connected {
+                let remote_target = state.borrow().workspaces.iter()
+                    .find(|ws| ws.id == workspace_id)
+                    .and_then(|ws| ws.remote_target.clone());
+                if let Some(target) = remote_target {
+                    crate::ssh_hosts::save_host(&target);
+                }
+            }
+            state.borrow_mut().update_connection_state(workspace_id, conn_state);
+        }
+        crate::ssh::SshEvent::RemoteOutput { pane_id, data } => {
+            // Dispatch remote output to the Ghostty surface via process_output. The registry is
+            // read into a local first: Ghostty may re-enter callbacks that take the same lock.
+            if let Some(surface) = surface_for_pane(pane_id) {
+                unsafe {
+                    crate::ghostty::ffi::ghostty_surface_process_output(
+                        surface,
+                        data.as_ptr() as *const _,
+                        data.len(),
+                    );
+                }
+                // Queue render for the GLArea associated with this surface
+                let gl_ptr = {
+                    let map = crate::ghostty::callbacks::GL_TO_SURFACE.lock();
+                    map.ok().and_then(|map| {
+                        map.iter().find(|(_, &s)| s == surface as usize).map(|(&g, _)| g)
+                    })
+                };
+                if let Some(gl_ptr) = gl_ptr {
+                    let area: glib::translate::Borrowed<gtk4::GLArea> =
+                        unsafe { glib::translate::from_glib_borrow(gl_ptr as *mut gtk4::ffi::GtkGLArea) };
+                    area.queue_render();
+                }
+            }
+        }
+        crate::ssh::SshEvent::RemoteEof { pane_id } => {
+            // D-08: write exit message to surface, keep pane open for user to close
+            if let Some(surface) = surface_for_pane(pane_id) {
+                let msg = b"\r\n\x1b[90m[Remote shell exited. Press any key to close]\x1b[0m\r\n";
+                unsafe {
+                    crate::ghostty::ffi::ghostty_surface_process_output(
+                        surface,
+                        msg.as_ptr() as *const _,
+                        msg.len(),
+                    );
+                }
+            }
+            // Clear stream_id and set eof flag so next keypress triggers close
+            if let Some(ctx) = state.borrow().remote_pane_contexts.get(&pane_id) {
+                if let Ok(mut sid) = ctx.stream_id.lock() {
+                    *sid = None;
+                }
+                ctx.eof_received.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        crate::ssh::SshEvent::ClosePaneRequest { pane_id } => {
+            // Pane ids are process-global; close just that pane (its workspace closes if it was the last one).
+            state.borrow_mut().close_pane(pane_id);
+        }
+        crate::ssh::SshEvent::StreamOpened { pane_id, stream_id } => {
+            // Set the stream_id on the IoWriteContext so keystrokes start flowing
+            if let Some(ctx) = state.borrow().remote_pane_contexts.get(&pane_id) {
+                if let Ok(mut sid) = ctx.stream_id.lock() {
+                    *sid = Some(stream_id);
+                }
+            }
+        }
+    }
+}
+
+/// Points ghostty at cmux's resources directory, which holds the shell-integration
+/// scripts. Without it ghostty turns shell integration off. The OSC 7 cwd reports
+/// stop, and new tabs and splits no longer open in the current folder.
+/// Must run before any thread exists, because it changes the environment.
+fn resolve_ghostty_resources_dir() {
+    if std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    match resolve_resources_dir(&resources_dir_candidates()) {
+        Some(dir) => std::env::set_var("GHOSTTY_RESOURCES_DIR", dir),
+        None => cmux_warn!("no ghostty resources dir found; shell integration (cwd tracking) is off"),
+    }
+}
+
+/// Candidate resource directories, in priority order.
+fn resources_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::var_os("CMUX_RESOURCES_DIR") {
+        candidates.push(PathBuf::from(dir));
+    }
+    if let Some(bin_dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from)) {
+        candidates.push(bin_dir.join("../share/cmux/ghostty"));
+    }
+    candidates.push(PathBuf::from("/usr/share/cmux/ghostty"));
+    candidates.push(PathBuf::from("/usr/lib/cmux/ghostty"));
+    {
+        // Running from a source tree (any profile): use the ghostty checkout nearby. Absent on
+        // installed systems, where the packaged paths above win.
+        let repo_ghostty = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ghostty");
+        candidates.push(repo_ghostty.join("zig-out/share/ghostty"));
+        candidates.push(repo_ghostty.join("src"));
+        if let Some(gh) = option_env!("CMUX_GHOSTTY_DIR") {
+            candidates.push(PathBuf::from(gh).join("zig-out/share/ghostty"));
+            candidates.push(PathBuf::from(gh).join("src"));
+        }
+    }
+    candidates
+}
+
+/// First candidate that holds a `shell-integration` directory.
+fn resolve_resources_dir(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|dir| dir.join("shell-integration").is_dir())
+        .cloned()
+}
+
+/// cmux's ghostty defaults, with `scrollback-limit` taken from [terminal].
+/// Written to a per-user runtime dir on each launch and loaded before the
+/// user's ~/.config/ghostty/config. Returns the file's path.
+fn write_ghostty_defaults(scrollback_bytes: u64) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let uid = unsafe { libc::getuid() };
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(run) => PathBuf::from(run).join("cmux"),
+        None => std::env::temp_dir().join(format!("cmux-{uid}")),
+    };
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    // In a shared temp dir another user could pre-create this path. Refuse it unless we own it.
+    if std::fs::metadata(&dir)?.uid() != uid {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "runtime dir is not owned by this user"));
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let path = dir.join("ghostty-defaults.conf");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    file.write_all(format!("scrollback-limit = {scrollback_bytes}\n{GHOSTTY_DEFAULTS}").as_bytes())?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_resources_dir_picks_first_with_shell_integration() {
+        let base = std::env::temp_dir().join(format!("cmux-res-test-{}", std::process::id()));
+        let no_si = base.join("no-si");
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&no_si).unwrap();
+        std::fs::create_dir_all(first.join("shell-integration")).unwrap();
+        std::fs::create_dir_all(second.join("shell-integration")).unwrap();
+
+        let missing = base.join("missing");
+        let candidates = vec![missing.clone(), no_si, second.clone(), first.clone()];
+        assert_eq!(resolve_resources_dir(&candidates), Some(second));
+        assert_eq!(resolve_resources_dir(&[missing]), None);
+        assert_eq!(resolve_resources_dir(&[]), None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ghostty_defaults_text_has_scrollback_and_clear() {
+        let text = format!("scrollback-limit = {}\n{GHOSTTY_DEFAULTS}", 2_000_000u64);
+        assert!(text.starts_with("scrollback-limit = 2000000\n"));
+        assert!(text.contains("\nkeybind = clear\n"));
+        assert!(text.contains("\nclipboard-read = deny\n"));
+    }
 }

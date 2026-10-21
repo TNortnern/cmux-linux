@@ -186,6 +186,63 @@ pub enum Commands {
         id: String,
     },
 
+    // -- Tab commands (Workspace -> Tabs -> Splits; tab indexes are 0-based) --
+    /// List the tabs of the active workspace (or of --workspace)
+    ListTabs {
+        /// Workspace UUID (default: active workspace)
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Open a new tab in the focused pane's folder
+    NewTab,
+    /// Select a tab by its 0-based index
+    SelectTab {
+        /// Tab index, as list-tabs shows it
+        index: usize,
+    },
+    /// Close a tab by its 0-based index (default: the selected tab)
+    CloseTab {
+        /// Tab index
+        index: Option<usize>,
+    },
+    /// Select the next tab
+    NextTab,
+    /// Select the previous tab
+    PrevTab,
+    /// Move a tab from one position to another
+    MoveTab {
+        /// Current 0-based index
+        from: usize,
+        /// Target 0-based index
+        to: usize,
+    },
+    /// Rename the selected tab
+    RenameTab {
+        /// New name
+        name: String,
+    },
+
+    // -- Layout commands (selected tab) --
+    /// Split the focused pane along its longer side
+    SplitAuto,
+    /// Print the folder of a pane (default: focused pane)
+    PaneCwd {
+        /// Pane UUID
+        id: Option<String>,
+    },
+    /// Move the nearest divider on one side of the focused pane
+    ResizePane {
+        /// left, right, up or down
+        direction: String,
+        /// Distance in pixels (1 to 10000)
+        #[arg(long, default_value_t = 40)]
+        px: u32,
+    },
+    /// Make all panes of the tab the same size
+    Equalize,
+    /// Toggle zoom on the focused pane
+    Zoom,
+
     // -- Browser subcommand group (agent primary interface) --
     /// Browser automation (agent primary interface)
     #[command(subcommand)]
@@ -401,7 +458,7 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
     // Use longer timeout for browser wait commands
     let timeout = match &cli.command {
         Commands::Browser(BrowserCommand::Wait { timeout_ms, .. }) => {
-            Duration::from_millis(timeout_ms + 5000)
+            Duration::from_millis(timeout_ms.saturating_add(5000))
         }
         _ => Duration::from_secs(5),
     };
@@ -651,6 +708,90 @@ fn command_to_rpc(cmd: &Commands) -> (&'static str, serde_json::Value) {
             ("notification.clear", json!({"id": id}))
         }
 
+        Commands::ListTabs { workspace } => {
+            let mut p = serde_json::Map::new();
+            if let Some(ref ws) = workspace {
+                p.insert("workspace".into(), json!(ws));
+            }
+            ("tab.list", Value::Object(p))
+        }
+        Commands::NewTab => ("tab.new", json!({})),
+        Commands::SelectTab { index } => ("tab.select", json!({"index": index})),
+        Commands::CloseTab { index } => {
+            let mut p = serde_json::Map::new();
+            if let Some(index) = index {
+                p.insert("index".into(), json!(index));
+            }
+            ("tab.close", Value::Object(p))
+        }
+        Commands::NextTab => ("tab.next", json!({})),
+        Commands::PrevTab => ("tab.prev", json!({})),
+        Commands::MoveTab { from, to } => ("tab.move", json!({"from": from, "to": to})),
+        Commands::RenameTab { name } => ("tab.rename", json!({"name": name})),
+
+        Commands::SplitAuto => ("split.auto", json!({})),
+        Commands::PaneCwd { id } => {
+            let mut p = serde_json::Map::new();
+            if let Some(ref id) = id {
+                p.insert("id".into(), json!(id));
+            }
+            ("pane.cwd", Value::Object(p))
+        }
+        Commands::ResizePane { direction, px } => {
+            ("pane.resize", json!({"direction": direction, "px": px}))
+        }
+        Commands::Equalize => ("pane.equalize", json!({})),
+        Commands::Zoom => ("pane.zoom", json!({})),
+
         Commands::Browser(cmd) => browser_command_to_rpc(cmd),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// Parses `cmux <args>` and returns the RPC method and params it maps to.
+    fn rpc(args: &[&str]) -> (String, Value) {
+        let mut argv = vec!["cmux"];
+        argv.extend_from_slice(args);
+        let cli = Cli::try_parse_from(argv).expect("args should parse");
+        let (method, params) = command_to_rpc(&cli.command);
+        (method.to_string(), params)
+    }
+
+    #[test]
+    fn tab_commands_map_to_socket_methods() {
+        assert_eq!(rpc(&["list-tabs"]), ("tab.list".into(), json!({})));
+        assert_eq!(rpc(&["list-tabs", "--workspace", "ws-1"]), ("tab.list".into(), json!({"workspace": "ws-1"})));
+        assert_eq!(rpc(&["new-tab"]), ("tab.new".into(), json!({})));
+        assert_eq!(rpc(&["select-tab", "2"]), ("tab.select".into(), json!({"index": 2})));
+        assert_eq!(rpc(&["close-tab"]), ("tab.close".into(), json!({})));
+        assert_eq!(rpc(&["close-tab", "0"]), ("tab.close".into(), json!({"index": 0})));
+        assert_eq!(rpc(&["next-tab"]), ("tab.next".into(), json!({})));
+        assert_eq!(rpc(&["prev-tab"]), ("tab.prev".into(), json!({})));
+        assert_eq!(rpc(&["move-tab", "0", "3"]), ("tab.move".into(), json!({"from": 0, "to": 3})));
+        assert_eq!(rpc(&["rename-tab", "build"]), ("tab.rename".into(), json!({"name": "build"})));
+    }
+
+    #[test]
+    fn layout_commands_map_to_socket_methods() {
+        assert_eq!(rpc(&["split-auto"]), ("split.auto".into(), json!({})));
+        assert_eq!(rpc(&["pane-cwd"]), ("pane.cwd".into(), json!({})));
+        assert_eq!(rpc(&["pane-cwd", "abc"]), ("pane.cwd".into(), json!({"id": "abc"})));
+        assert_eq!(rpc(&["resize-pane", "left"]), ("pane.resize".into(), json!({"direction": "left", "px": 40})));
+        assert_eq!(
+            rpc(&["resize-pane", "up", "--px", "80"]),
+            ("pane.resize".into(), json!({"direction": "up", "px": 80}))
+        );
+        assert_eq!(rpc(&["equalize"]), ("pane.equalize".into(), json!({})));
+        assert_eq!(rpc(&["zoom"]), ("pane.zoom".into(), json!({})));
+    }
+
+    #[test]
+    fn select_tab_needs_an_index() {
+        assert!(Cli::try_parse_from(["cmux", "select-tab"]).is_err());
+        assert!(Cli::try_parse_from(["cmux", "select-tab", "-1"]).is_err());
     }
 }
