@@ -202,25 +202,32 @@ pub fn confirm_close_workspace(state: &Rc<RefCell<AppState>>, app: &gtk4::Applic
         return; // No-op: cannot close the last workspace
     }
 
-    let dialog = gtk4::AlertDialog::builder()
-        .message("Close Workspace?")
-        .detail("All panes in this workspace will be closed. This cannot be undone.")
-        .modal(true)
-        .build();
-    dialog.set_buttons(&["Keep Workspace", "Close Workspace"]);
-    dialog.set_default_button(0);
-    dialog.set_cancel_button(0);
-
-    let window = app.windows().into_iter().next();
-
-    dialog.choose(window.as_ref(), None::<&gtk4::gio::Cancellable>, move |result| {
-        // Button index 1 = "Close Workspace" (destructive)
-        if let Ok(1) = result {
-            defer(move |s| {
-                s.close_workspace_by_id(ws_id);
-            });
-        }
-    });
+    // MessageDialog works on every GTK 4 (AlertDialog needs 4.10; Ubuntu 22.04 ships 4.6).
+    #[allow(deprecated)]
+    {
+        use gtk4::prelude::*;
+        let window = app.windows().into_iter().next();
+        let dialog = gtk4::MessageDialog::new(
+            window.as_ref(),
+            gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+            gtk4::MessageType::Question,
+            gtk4::ButtonsType::None,
+            "Close Workspace?",
+        );
+        dialog.set_secondary_text(Some("All panes in this workspace will be closed. This cannot be undone."));
+        dialog.add_button("Keep Workspace", gtk4::ResponseType::Cancel);
+        dialog.add_button("Close Workspace", gtk4::ResponseType::Accept);
+        dialog.set_default_response(gtk4::ResponseType::Cancel);
+        dialog.connect_response(move |d, response| {
+            if response == gtk4::ResponseType::Accept {
+                defer(move |s| {
+                    s.close_workspace_by_id(ws_id);
+                });
+            }
+            d.close();
+        });
+        dialog.present();
+    }
 }
 
 /// Split the active pane. `vertical=false` -> split right (Alt+Shift+=), `vertical=true` -> split down (Alt+Shift+-).

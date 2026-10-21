@@ -510,9 +510,12 @@ pub fn create_surface(
             if let Some(surface) = *cell.borrow() {
                 // Prefer fractional scale from GdkSurface (Wayland fractional scaling)
                 // over Widget::scale_factor() which returns the integer ceiling.
+                // GdkSurface:scale exists from GTK 4.12; older GTK (Ubuntu 22.04 ships 4.6)
+                // only has the integer scale factor.
                 let scale = widget.native()
                     .and_then(|n| n.surface())
-                    .map(|s| s.scale())
+                    .filter(|s| s.find_property("scale").is_some())
+                    .map(|s| s.property::<f64>("scale"))
                     .unwrap_or(widget.scale_factor() as f64);
                 unsafe {
                     ffi::ghostty_surface_set_content_scale(surface, scale, scale);
