@@ -61,7 +61,10 @@ jobs:
 
       - name: Set up Zig and build libghostty
         # Installs Zig 0.15.2 (SHA-256 verified) and builds libghostty; system packages are above.
-        run: scripts/setup-linux.sh --no-deps
+        run: |
+          scripts/setup-linux.sh --no-deps
+          # Later steps (terminfo generation in the packagers) run zig too.
+          echo "$HOME/.local/zig" >> "$GITHUB_PATH"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
