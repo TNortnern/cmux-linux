@@ -4,6 +4,13 @@ All notable changes to cmux for Linux are documented here.
 
 This project is a Linux port of [cmux](https://github.com/manaflow-ai/cmux) by manaflow-ai, which was originally written for macOS.
 
+## 0.2.2
+
+- **Fix: `cmux send-text` commands now run.** Line breaks in the text are sent as a real Enter
+  key press. Before, the shell received them inside a bracketed paste and only inserted them, so
+  scripted commands were typed but never executed in packaged installs. `cmux send-key enter`
+  presses Enter too.
+
 ## 0.2.1
 
 ### Runs on Ubuntu 22.04
