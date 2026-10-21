@@ -15,6 +15,61 @@ fn err(req_id: Value, code: &str, message: &str) -> Value {
     json!({"id": req_id, "ok": false, "error": {"code": code, "message": message}})
 }
 
+/// A piece of `send_text` input: literal text, or a line break that must act as the Enter key.
+#[derive(Debug, PartialEq)]
+enum TextPart<'a> {
+    Text(&'a str),
+    Enter,
+}
+
+/// Splits text at line breaks ("\r\n", "\r" and "\n" each count as one Enter).
+fn split_text_parts(text: &str) -> Vec<TextPart<'_>> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(['\r', '\n']) {
+        if i > 0 {
+            parts.push(TextPart::Text(&rest[..i]));
+        }
+        parts.push(TextPart::Enter);
+        let skip = if rest[i..].starts_with("\r\n") { 2 } else { 1 };
+        rest = &rest[i + skip..];
+    }
+    if !rest.is_empty() {
+        parts.push(TextPart::Text(rest));
+    }
+    parts
+}
+
+/// XKB keycode of Return (evdev 28 + 8), the raw hardware keycode GTK hands to Ghostty.
+const XKB_KEYCODE_RETURN: u32 = 36;
+
+/// Presses and releases Return, exactly as a GTK key event reaches Ghostty.
+fn press_enter(surf: crate::ghostty::ffi::ghostty_surface_t) {
+    use crate::ghostty::ffi;
+    let mut input = unsafe { std::mem::zeroed::<ffi::ghostty_input_key_s>() };
+    input.keycode = XKB_KEYCODE_RETURN;
+    input.action = ffi::ghostty_input_action_e_GHOSTTY_ACTION_PRESS;
+    input.text = c"\r".as_ptr();
+    unsafe { ffi::ghostty_surface_key(surf, input) };
+    input.action = ffi::ghostty_input_action_e_GHOSTTY_ACTION_RELEASE;
+    input.text = std::ptr::null();
+    unsafe { ffi::ghostty_surface_key(surf, input) };
+}
+
+/// Types `text` into a surface. Text goes through Ghostty's text input, which the shell sees as
+/// a paste once it enables bracketed paste, and a line break pasted that way is inserted, not
+/// executed. So every line break is sent as a real Enter key press instead.
+fn type_into_surface(surf: crate::ghostty::ffi::ghostty_surface_t, text: &str) {
+    for part in split_text_parts(text) {
+        match part {
+            TextPart::Text(chunk) => unsafe {
+                crate::ghostty::ffi::ghostty_surface_text(surf, chunk.as_ptr().cast(), chunk.len());
+            },
+            TextPart::Enter => press_enter(surf),
+        }
+    }
+}
+
 /// Resolve a surface_ref string ("surface:N" or UUID) to a UUID string.
 /// Returns Ok(uuid_string) or Err((error_message, available_refs)).
 fn resolve_surface_ref(
@@ -606,14 +661,7 @@ pub fn handle_socket_command(
             };
             if let Some(surf) = surface {
                 if !surf.is_null() {
-                    let c_text = std::ffi::CString::new(text.clone()).unwrap_or_default();
-                    unsafe {
-                        crate::ghostty::ffi::ghostty_surface_text(
-                            surf,
-                            c_text.as_ptr(),
-                            c_text.to_bytes().len(),
-                        );
-                    }
+                    type_into_surface(surf, &text);
                 }
             }
             let _ = resp_tx.send(ok(req_id, json!({})));
@@ -635,7 +683,9 @@ pub fn handle_socket_command(
                 } else { None }
             };
             if let Some(surf) = surface {
-                if !surf.is_null() && key.len() == 1 {
+                if !surf.is_null() && matches!(key.to_ascii_lowercase().as_str(), "enter" | "return") {
+                    press_enter(surf);
+                } else if !surf.is_null() && key.len() == 1 {
                     let c_key = std::ffi::CString::new(key.clone()).unwrap_or_default();
                     unsafe {
                         crate::ghostty::ffi::ghostty_surface_text(
@@ -1070,4 +1120,18 @@ fn pane_folder(engine: &crate::split_engine::SplitEngine, pane_id: u64) -> Optio
         _ => None,
     };
     path.map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{split_text_parts, TextPart::*};
+
+    #[test]
+    fn line_breaks_become_enter() {
+        assert_eq!(split_text_parts("ls -la\r"), vec![Text("ls -la"), Enter]);
+        assert_eq!(split_text_parts("a\nb\r\nc"), vec![Text("a"), Enter, Text("b"), Enter, Text("c")]);
+        assert_eq!(split_text_parts("\r\r"), vec![Enter, Enter]);
+        assert_eq!(split_text_parts("no newline"), vec![Text("no newline")]);
+        assert!(split_text_parts("").is_empty());
+    }
 }
