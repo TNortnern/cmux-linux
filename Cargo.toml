@@ -1,6 +1,6 @@
 [package]
 name = "cmux-linux"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "GPU-accelerated terminal multiplexer for Linux (GTK4 + Ghostty)"
 license = "AGPL-3.0-or-later"
@@ -17,7 +17,7 @@ name = "cmux"
 path = "src/bin/cmux.rs"
 
 [dependencies]
-gtk4 = { version = "0.10.3", features = ["v4_12", "v4_14"] }
+gtk4 = { version = "0.10.3", features = ["v4_6"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "process", "io-util"] }
 glib = "0.21.5"
 serde = { version = "1", features = ["derive"] }

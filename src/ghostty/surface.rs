@@ -151,6 +151,35 @@ pub fn teardown_pane(gl_area: &gtk4::GLArea, surface: &SurfaceCell, ctx: &CtxCel
     }
 }
 
+/// Lowest OpenGL version Ghostty's renderer accepts.
+const MIN_GL_VERSION: (i32, i32) = (4, 3);
+
+/// The GPU driver's OpenGL is too old for Ghostty. Restart once on Mesa's software rasterizer
+/// (OpenGL 4.5); if that was already tried, exit with an explanation instead of a blank window.
+/// Runs at the first pane's realize, before any session state has changed.
+fn fall_back_to_software_gl(major: i32, minor: i32) -> ! {
+    if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
+        cmux_warn!(
+            "OpenGL {major}.{minor} is older than the 4.{} cmux needs; restarting with software rendering",
+            MIN_GL_VERSION.1
+        );
+        if let Ok(exe) = std::env::current_exe() {
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env("LIBGL_ALWAYS_SOFTWARE", "1")
+                .exec(); // only returns on failure
+            cmux_warn!("could not restart with software rendering: {err}");
+        }
+    }
+    cmux_warn!(
+        "FATAL: OpenGL {major}.{minor} is available but cmux needs 4.{}. Update your GPU driver or \
+         install Mesa (llvmpipe provides 4.5).",
+        MIN_GL_VERSION.1
+    );
+    std::process::exit(1);
+}
+
 /// Creates and returns a GtkGLArea with a Ghostty terminal surface wired up.
 /// Initializes ghostty_app_t, then defers ghostty_surface_t creation to the
 /// GtkGLArea realize signal — when the GL context is guaranteed to exist.
@@ -283,10 +312,14 @@ pub fn create_surface(
                 return;
             }
 
-            // Log GL version and renderer info for diagnostics.
+            // Ghostty's renderer needs OpenGL 4.3. Some drivers stop at 4.2 (older GPUs, or WSL's
+            // D3D12 path); Mesa's software rasterizer always offers 4.5, so retry with it.
             if let Some(gl_ctx) = area.context() {
                 let (major, minor) = gl_ctx.version();
                 cmux_debug!("GL context version: {major}.{minor}");
+                if (major, minor) < MIN_GL_VERSION {
+                    fall_back_to_software_gl(major, minor);
+                }
             }
 
             // Create the ghostty surface now that GL context is current.
@@ -352,7 +385,10 @@ pub fn create_surface(
 
                 let s = ffi::ghostty_surface_new(ghostty_app, &surface_config);
                 if s.is_null() {
-                    cmux_warn!("FATAL: ghostty_surface_new returned null");
+                    cmux_warn!(
+                        "FATAL: the terminal engine could not start (ghostty_surface_new failed). \
+                         Run with CMUX_DEBUG=1 for details; on old GPUs try LIBGL_ALWAYS_SOFTWARE=1."
+                    );
                     std::process::exit(1);
                 }
                 // Hidden panes start hidden: occlusion may have been set before realize.
@@ -510,9 +546,12 @@ pub fn create_surface(
             if let Some(surface) = *cell.borrow() {
                 // Prefer fractional scale from GdkSurface (Wayland fractional scaling)
                 // over Widget::scale_factor() which returns the integer ceiling.
+                // GdkSurface:scale exists from GTK 4.12; older GTK (Ubuntu 22.04 ships 4.6)
+                // only has the integer scale factor.
                 let scale = widget.native()
                     .and_then(|n| n.surface())
-                    .map(|s| s.scale())
+                    .filter(|s| s.find_property("scale").is_some())
+                    .map(|s| s.property::<f64>("scale"))
                     .unwrap_or(widget.scale_factor() as f64);
                 unsafe {
                     ffi::ghostty_surface_set_content_scale(surface, scale, scale);

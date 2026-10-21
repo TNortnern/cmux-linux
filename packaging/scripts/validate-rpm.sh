@@ -91,12 +91,12 @@ check "License is AGPL-3.0-or-later" grep -q -E "^License +: AGPL-3.0-or-later$"
 
 echo ""
 echo "Dependencies:"
-for dep in "gtk4 >= 4.14" fontconfig freetype mesa-libGL bzip2-libs libstdc++ libgcc; do
+for dep in "gtk4 >= 4.6" fontconfig freetype mesa-libGL bzip2-libs libstdc++ libgcc; do
     name="${dep%% *}"
     check "Requires $name" has_requires "$name"
 done
 check "agent-browser is not required" lacks "agent-browser" "$REQUIRES"
-check "libgtk 4.14 minimum" grep -q -F "gtk4 >= 4.14" <<<"$REQUIRES"
+check "libgtk 4.6 minimum" grep -q -F "gtk4 >= 4.6" <<<"$REQUIRES"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

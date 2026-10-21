@@ -100,7 +100,7 @@ echo "Dependencies:"
 for dep in libgtk-4-1 libfontconfig1 libfreetype6 libgl1 libbz2-1.0 libstdc++6 libgcc-s1; do
     check "Depends: $dep" has_dep "$dep"
 done
-check "GTK 4.14 minimum" grep -q -E "libgtk-4-1 \(>= 4\.14\)" <<<"$CONTROL"
+check "GTK 4.6 minimum" grep -q -E "libgtk-4-1 \(>= 4\.6\)" <<<"$CONTROL"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

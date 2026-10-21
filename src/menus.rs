@@ -405,28 +405,61 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
 ];
 
 /// Build GtkShortcutsWindow (D-14) with all shortcuts grouped by category.
-/// Uses GTK 4.14 add_section/add_group API.
+/// Built from GtkBuilder XML: the add_section/add_group API needs GTK 4.14, while XML works on
+/// every GTK 4 (Ubuntu 22.04 ships 4.6).
 fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
-    let window = gtk4::ShortcutsWindow::builder().build();
-    for (title, shortcuts) in SHORTCUT_GROUPS {
-        let section = gtk4::ShortcutsSection::builder()
-            .section_name(title.to_lowercase())
-            .title(*title)
-            .build();
-        let group = gtk4::ShortcutsGroup::builder().title(*title).build();
-        for (accel, label) in shortcuts.iter() {
-            group.add_shortcut(&shortcut(accel, label));
-        }
-        section.add_group(&group);
-        window.add_section(&section);
-    }
-    window
+    gtk4::Builder::from_string(&shortcuts_ui_xml())
+        .object("shortcuts")
+        .expect("shortcuts window in generated UI")
 }
 
-/// Helper to create a ShortcutsShortcut widget.
-fn shortcut(accel: &str, title: &str) -> gtk4::ShortcutsShortcut {
-    gtk4::ShortcutsShortcut::builder()
-        .accelerator(accel)
-        .title(title)
-        .build()
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// GtkBuilder UI for the shortcuts window, generated from SHORTCUT_GROUPS.
+fn shortcuts_ui_xml() -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<interface>
+<object class=\"GtkShortcutsWindow\" id=\"shortcuts\">
+",
+    );
+    for (title, shortcuts) in SHORTCUT_GROUPS {
+        xml.push_str(&format!(
+            "<child><object class=\"GtkShortcutsSection\"><property name=\"section-name\">{}</property><property name=\"title\">{}</property>
+<child><object class=\"GtkShortcutsGroup\"><property name=\"title\">{}</property>
+",
+            xml_escape(&title.to_lowercase()),
+            xml_escape(title),
+            xml_escape(title)
+        ));
+        for (accel, label) in shortcuts.iter() {
+            xml.push_str(&format!(
+                "<child><object class=\"GtkShortcutsShortcut\"><property name=\"accelerator\">{}</property><property name=\"title\">{}</property></object></child>
+",
+                xml_escape(accel),
+                xml_escape(label)
+            ));
+        }
+        xml.push_str("</object></child>
+</object></child>
+");
+    }
+    xml.push_str("</object>
+</interface>
+");
+    xml
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shortcuts_ui_xml_is_escaped_and_lists_every_shortcut() {
+        let xml = super::shortcuts_ui_xml();
+        assert!(xml.contains("&lt;Ctrl&gt;&lt;Shift&gt;c"));
+        assert!(!xml.contains("<Ctrl>"));
+        let count: usize = super::SHORTCUT_GROUPS.iter().map(|(_, s)| s.len()).sum();
+        assert_eq!(xml.matches("GtkShortcutsShortcut").count(), count);
+    }
 }
