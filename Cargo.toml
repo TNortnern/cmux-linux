@@ -1,6 +1,6 @@
 [package]
 name = "cmux-linux"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "GPU-accelerated terminal multiplexer for Linux (GTK4 + Ghostty)"
 license = "AGPL-3.0-or-later"

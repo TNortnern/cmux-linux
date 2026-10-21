@@ -4,6 +4,21 @@ All notable changes to cmux for Linux are documented here.
 
 This project is a Linux port of [cmux](https://github.com/manaflow-ai/cmux) by manaflow-ai, which was originally written for macOS.
 
+## 0.2.1
+
+### Runs on Ubuntu 22.04
+
+- **GTK 4.6 is now the minimum** (was 4.14), so cmux runs on Ubuntu 22.04, Debian 12 and newer.
+  Fractional scaling is used when GTK 4.12+ provides it, with a fall back to integer scaling.
+  The close-workspace dialog and the shortcuts window use APIs every GTK 4 has.
+- **Release packages are built on Ubuntu 22.04** (glibc 2.35 baseline), so the AppImage, `.deb`
+  and `.rpm` run on 22.04 and everything newer.
+- **Older OpenGL fallback.** When the GPU driver offers less than the OpenGL 4.3 that Ghostty
+  needs (older GPUs, WSL), cmux restarts itself once on Mesa's software rasterizer instead of
+  exiting silently.
+- Verified on a clean Ubuntu 22.04.5 (GTK 4.6.9, glibc 2.35): built from a fresh clone with
+  `scripts/setup-linux.sh`, 111 unit tests and 19/19 end-to-end checks.
+
 ## 0.2.0
 
 ### Highlights
