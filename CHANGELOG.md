@@ -4,6 +4,12 @@ All notable changes to cmux for Linux are documented here.
 
 This project is a Linux port of [cmux](https://github.com/manaflow-ai/cmux) by manaflow-ai, which was originally written for macOS.
 
+## 0.2.4
+
+- **Fix: scrolling direction.** The mouse wheel and touchpad scrolled the opposite way (wheel up
+  moved toward the bottom). cmux now inverts GTK's deltas for Ghostty the same way Ghostty's own
+  Linux app does. Touchpad scrolling is also smoother, no longer rounded to whole steps.
+
 ## 0.2.3
 
 - **Dark chrome under any theme.** Header bar buttons, tab close and new-tab buttons and the

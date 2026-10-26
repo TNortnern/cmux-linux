@@ -741,30 +741,36 @@ pub fn create_surface(
     gl_area.add_controller(focus_controller);
 
     // ── Scroll input ─────────────────────────────────────────────────────────────
-    let scroll_controller = gtk4::EventControllerScroll::new(
-        gtk4::EventControllerScrollFlags::BOTH_AXES | gtk4::EventControllerScrollFlags::DISCRETE,
-    );
+    // Mirrors Ghostty's own GTK runtime (apprt/gtk/class/surface.zig, ecMouseScrollVertical).
+    let scroll_controller =
+        gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
+    // GTK brackets touchpad gestures with scroll-begin/scroll-end; a mouse wheel sends neither.
+    let precision = Rc::new(Cell::new(false));
+    scroll_controller.connect_scroll_begin({
+        let precision = precision.clone();
+        move |_| precision.set(true)
+    });
+    scroll_controller.connect_scroll_end({
+        let precision = precision.clone();
+        move |_| precision.set(false)
+    });
     scroll_controller.connect_scroll({
         let cell = surface_cell.clone();
-        move |ctrl, dx, dy| {
+        move |_ctrl, dx, dy| {
             let surface = match *cell.borrow() {
                 Some(s) => s,
                 None => return gtk4::glib::Propagation::Proceed,
             };
-            // Detect if this is pixel-precise (touchpad) or discrete (mouse wheel)
-            let is_pixel = ctrl
-                .current_event()
-                .and_then(|e| e.downcast::<gtk4::gdk::ScrollEvent>().ok())
-                .map(|se| se.direction() == gtk4::gdk::ScrollDirection::Smooth)
-                .unwrap_or(false);
-
-            // ghostty_input_scroll_mods_t is a bitmask:
-            // bit 0: scroll_is_pixel (1 if touchpad, 0 if mouse wheel)
-            // bit 1: momentum (1 if momentum scrolling)
-            let scroll_mods = if is_pixel { 1 } else { 0 };
+            let is_precision = precision.get();
+            // GTK reports dy > 0 for "scroll down"; Ghostty's API takes the macOS convention
+            // (positive = scroll up), so both axes are inverted. Touchpad deltas are small, so
+            // they are scaled by 10 as Ghostty does.
+            let factor = if is_precision { -10.0 } else { -1.0 };
+            // ghostty_input_scroll_mods_t bit 0: precision (touchpad) scrolling.
+            let scroll_mods = if is_precision { 1 } else { 0 };
 
             unsafe {
-                ffi::ghostty_surface_mouse_scroll(surface, dx, dy, scroll_mods);
+                ffi::ghostty_surface_mouse_scroll(surface, dx * factor, dy * factor, scroll_mods);
             }
             gtk4::glib::Propagation::Stop
         }
