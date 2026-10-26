@@ -74,8 +74,6 @@ paned > separator:hover { background-color: #5b8dd9; }
     border-radius: 50%;
     min-width: 8px;
     min-height: 8px;
-    max-width: 8px;
-    max-height: 8px;
     margin: 0 4px;
 }
 /* Phase 4: SSH connection state subtitle (SSH-01, SSH-04) */
@@ -104,7 +102,6 @@ paned > separator:hover { background-color: #5b8dd9; }
 .browser-nav-btn:active { background-color: rgba(255, 255, 255, 0.12); }
 .browser-nav-btn:disabled { color: #555555; }
 .browser-nav-go { color: #5b8dd9; font-weight: 600; }
-.browser-nav-devtools { margin-left: auto; }
 .browser-nav-devtools:checked { background-color: rgba(91, 141, 217, 0.2); color: #5b8dd9; }
 /* Phase 8 Plan 06: DevTools overlay */
 .devtools-overlay { background-color: rgba(26, 26, 26, 0.92); }
@@ -137,6 +134,15 @@ popover.menu accelerator { color: #5b8dd9; font-size: 12px; }
 .tab-add { min-width: 28px; min-height: 28px; padding: 0; margin: 0 4px; background-color: transparent; color: #cccccc; border: none; }
 .tab-add:hover { background-color: #2e2e2e; }
 .tab-rename { font-size: 13px; padding: 0 4px; }
+/* cmux draws its own dark chrome. Themes (Adwaita light, Yaru) give buttons and the header bar
+   gradients, shadows and borders on top of background-color; clear them so every theme matches. */
+.cmux-headerbar { background-image: none; box-shadow: none; border-bottom: 1px solid #3a3a3a; color: #cccccc; }
+.cmux-headerbar .title { color: #cccccc; }
+.cmux-headerbar windowcontrols button { background-image: none; box-shadow: none; border: none; color: #cccccc; }
+.cmux-headerbar windowcontrols button:hover { background-color: rgba(255, 255, 255, 0.08); }
+.headerbar-btn, .sidebar-add-btn, .sidebar-close-btn, .tab-close, .tab-add, .browser-nav-btn {
+    background-image: none; box-shadow: none; text-shadow: none; -gtk-icon-shadow: none; outline: none;
+}
 ";
 
 fn main() {
@@ -169,6 +175,13 @@ fn main() {
         std::env::set_var("LP_NUM_THREADS", "2");
     }
     resolve_ghostty_resources_dir();
+    // The AppImage's GTK hook pins GTK_THEME to Adwaita:<desktop scheme>, usually light. cmux's
+    // chrome is dark, so a light theme leaves light dialogs and window controls in a dark window.
+    if std::env::var_os("APPIMAGE").is_some()
+        && std::env::var("GTK_THEME").is_ok_and(|t| t.eq_ignore_ascii_case("Adwaita:light"))
+    {
+        std::env::set_var("GTK_THEME", "Adwaita:dark");
+    }
 
     // Socket I/O, session saves and ssh tunnels need only a few workers. The GTK main
     // thread does the UI work, so extra workers would just cost memory.
@@ -325,7 +338,11 @@ fn build_ui(
         ghostty_app
     };
 
-    // 2. Load CSS
+    // 2. Load CSS. The chrome is dark, so ask the theme for its dark variant too (Adwaita-dark,
+    // Yaru-dark); dialogs, menus and window controls then match.
+    if let Some(settings) = gtk4::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(true);
+    }
     let provider = CssProvider::new();
     provider.load_from_data(APP_CSS);
     gtk4::style_context_add_provider_for_display(

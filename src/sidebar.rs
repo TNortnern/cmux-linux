@@ -157,13 +157,9 @@ pub fn start_inline_rename(list_box: &gtk4::ListBox, state: &AppStateRef) {
         let finish = finish.clone();
         move |e| finish(Some(e.text().to_string()))
     });
-    entry.connect_has_focus_notify({
+    on_focus_leave(&entry, {
         let finish = finish.clone();
-        move |e| {
-            if !e.has_focus() {
-                finish(Some(e.text().to_string()));
-            }
-        }
+        move |e| finish(Some(e.text().to_string()))
     });
     let keys = gtk4::EventControllerKey::new();
     keys.connect_key_pressed(move |_, key, _, _| {
@@ -175,10 +171,47 @@ pub fn start_inline_rename(list_box: &gtk4::ListBox, state: &AppStateRef) {
         }
     });
     entry.add_controller(keys);
-    entry.grab_focus();
+    focus_when_shown(&entry);
 }
 
-/// Sidebar row content: GtkBox(H, 4) > [GtkBox(V, 0) > [GtkLabel(name)], GtkLabel(dot), Button(close)].
+/// Calls `f` when keyboard focus leaves `entry`. GtkEntry's own has-focus stays false (its inner
+/// GtkText holds the focus), so a focus controller, which tracks the whole subtree, is used.
+pub fn on_focus_leave(entry: &gtk4::Entry, f: impl Fn(&gtk4::Entry) + 'static) {
+    let focus = gtk4::EventControllerFocus::new();
+    let weak = entry.downgrade();
+    focus.connect_leave(move |_| {
+        if let Some(entry) = weak.upgrade() {
+            f(&entry);
+        }
+    });
+    entry.add_controller(focus);
+}
+
+/// Moves keyboard focus into a freshly built entry and selects its text. Deferred to an idle:
+/// grab_focus does nothing until the entry is in a window, and a closing popover or the click
+/// that started the rename hands focus back to the terminal first.
+pub fn focus_when_shown(entry: &gtk4::Entry) {
+    let weak = entry.downgrade();
+    gtk4::glib::idle_add_local_once(move || {
+        if let Some(entry) = weak.upgrade() {
+            entry.grab_focus();
+            entry.select_region(0, -1);
+        }
+    });
+}
+
+/// The unread-bell dot: an empty box sized by the `attention-dot` CSS (8x8, round). A label would
+/// be a text line tall, and GTK before 4.12 ignores the max-height that would clamp it, so it
+/// rendered as a tall oval. Centered so the row's height does not stretch it either.
+pub fn attention_dot() -> gtk4::Box {
+    let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    dot.add_css_class("attention-dot");
+    dot.set_valign(gtk4::Align::Center);
+    dot.set_halign(gtk4::Align::Center);
+    dot
+}
+
+/// Sidebar row content: GtkBox(H, 4) > [GtkBox(V, 0) > [GtkLabel(name)], GtkBox(dot), Button(close)].
 /// Dot is hidden by default. The close button is hidden until the row is hovered (D-02), and is
 /// wired by `wire_row` when the row is added to the sidebar.
 pub fn row_content(name: &str) -> gtk4::Box {
@@ -191,8 +224,7 @@ pub fn row_content(name: &str) -> gtk4::Box {
     vbox.set_hexpand(true);
     hbox.append(&vbox);
 
-    let dot = gtk4::Label::new(None);
-    dot.add_css_class("attention-dot");
+    let dot = attention_dot();
     dot.set_visible(false);
     hbox.append(&dot);
 

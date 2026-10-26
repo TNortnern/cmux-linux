@@ -21,7 +21,7 @@ struct Item {
     id: u64,
     widget: gtk4::Box,
     label: gtk4::Label,
-    dot: gtk4::Label,
+    dot: gtk4::Box,
 }
 
 pub struct TabBar {
@@ -139,12 +139,11 @@ impl TabBar {
                 let text = e.text().to_string();
                 defer(move |s| s.end_tab_rename(ws_id, id, Some(text)));
             });
-            // Focus-out commits the edit. A rename that already ended is ignored by AppState.
-            entry.connect_has_focus_notify(move |e| {
-                if !e.has_focus() {
-                    let text = e.text().to_string();
-                    defer(move |s| s.end_tab_rename(ws_id, id, Some(text)));
-                }
+            // Focus leaving the entry commits the edit. A rename that already ended is ignored by
+            // AppState.
+            crate::sidebar::on_focus_leave(&entry, move |e| {
+                let text = e.text().to_string();
+                defer(move |s| s.end_tab_rename(ws_id, id, Some(text)));
             });
             let keys = gtk4::EventControllerKey::new();
             keys.connect_key_pressed(move |_, key, _, _| {
@@ -157,14 +156,13 @@ impl TabBar {
             });
             entry.add_controller(keys);
             widget.append(&entry);
-            entry.grab_focus();
+            crate::sidebar::focus_when_shown(&entry);
         } else {
             widget.append(&label);
         }
 
         // Attention dot: shown while a pane in this tab has an unread bell.
-        let dot = gtk4::Label::new(None);
-        dot.add_css_class("attention-dot");
+        let dot = crate::sidebar::attention_dot();
         dot.set_visible(tab.attention);
         widget.append(&dot);
 

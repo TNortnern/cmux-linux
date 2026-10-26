@@ -4,6 +4,17 @@ All notable changes to cmux for Linux are documented here.
 
 This project is a Linux port of [cmux](https://github.com/manaflow-ai/cmux) by manaflow-ai, which was originally written for macOS.
 
+## 0.2.3
+
+- **Dark chrome under any theme.** Header bar buttons, tab close and new-tab buttons and the
+  sidebar's add button no longer show as white boxes under Adwaita light or Yaru, and the
+  AppImage no longer forces the light theme. Menus, dialogs and window controls use the
+  theme's dark variant.
+- **Fix: renaming tabs and workspaces.** Double-click, Ctrl+Shift+R and the sidebar's Rename
+  now focus the editor with the old name selected. Before, typing went to the terminal.
+  Clicking away commits the new name.
+- **The bell dot is a small circle** on GTK 4.6. It used to stretch into a tall oval.
+
 ## 0.2.2
 
 - **Fix: `cmux send-text` commands now run.** Line breaks in the text are sent as a real Enter
